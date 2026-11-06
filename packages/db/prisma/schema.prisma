@@ -1,0 +1,380 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated"
+  runtime  = "bun"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id               String @id @default(uuid()) @db.Uuid
+  name             String
+  email            String @unique
+  emailVerified    Boolean @default(false)
+  image            String?
+  twoFactorEnabled Boolean @default(false)
+  createdAt        DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime @updatedAt @db.Timestamptz(3)
+  sessions         Session[]
+  accounts         Account[]
+  factors          TwoFactor[]
+  memberships      Membership[]
+  recordedPayments Payment[]
+  paymentReversals PaymentReversal[]
+}
+
+model Session {
+  id        String @id @default(uuid()) @db.Uuid
+  token     String @unique
+  expiresAt DateTime @db.Timestamptz(3)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+  ipAddress String?
+  userAgent String?
+  userId    String @db.Uuid
+  user      User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@index([userId])
+}
+
+model Account {
+  id                    String @id @default(uuid()) @db.Uuid
+  accountId             String
+  providerId            String
+  userId                String @db.Uuid
+  user                  User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime? @db.Timestamptz(3)
+  refreshTokenExpiresAt DateTime? @db.Timestamptz(3)
+  scope                 String?
+  password              String?
+  createdAt             DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt             DateTime @updatedAt @db.Timestamptz(3)
+  @@unique([providerId, accountId])
+  @@index([userId])
+}
+
+model Verification {
+  id         String @id @default(uuid()) @db.Uuid
+  identifier String
+  value      String
+  expiresAt  DateTime @db.Timestamptz(3)
+  createdAt  DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt  DateTime @updatedAt @db.Timestamptz(3)
+  @@index([identifier])
+}
+
+model TwoFactor {
+  id          String @id @default(uuid()) @db.Uuid
+  secret      String
+  backupCodes String
+  verified    Boolean @default(true)
+  failedVerificationCount Int @default(0)
+  lockedUntil DateTime? @db.Timestamptz(3)
+  userId      String @db.Uuid
+  user        User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@index([userId])
+}
+
+model RateLimit {
+  id          String @id @default(uuid()) @db.Uuid
+  key         String @unique
+  count       Int
+  lastRequest BigInt
+}
+
+model Organization {
+  id                  String @id @default(uuid()) @db.Uuid
+  name                String
+  whatsappEnabled     Boolean @default(false)
+  createdAt           DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt           DateTime @updatedAt @db.Timestamptz(3)
+  memberships         Membership[]
+  properties          Property[]
+  tenants             Tenant[]
+  audit               AuditLog[]
+  sender              WhatsAppSender?
+  billingJobs         BillingJob[]
+}
+
+enum Role {
+  OWNER
+  STAFF
+}
+
+model Membership {
+  organizationId String @db.Uuid
+  userId         String @db.Uuid
+  role           Role @default(OWNER)
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  user           User @relation(fields: [userId], references: [id], onDelete: Restrict)
+  @@id([organizationId, userId])
+  @@index([userId, role])
+}
+
+model Property {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @db.Uuid
+  name           String
+  address        String?
+  notes          String?
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @db.Timestamptz(3)
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  rooms          Room[]
+  @@unique([organizationId, id])
+  @@index([organizationId, name])
+}
+
+model Room {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @db.Uuid
+  propertyId     String @db.Uuid
+  name           String
+  notes          String?
+  suggestedPaise Int?
+  suggestedDay   Int?
+  archivedAt     DateTime? @db.Timestamptz(3)
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @db.Timestamptz(3)
+  property       Property @relation(fields: [organizationId, propertyId], references: [organizationId, id], onDelete: Restrict)
+  leases         Lease[]
+  @@unique([organizationId, id])
+  @@unique([organizationId, propertyId, name])
+}
+
+model Tenant {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @db.Uuid
+  name           String
+  phone          String?
+  whatsapp       String?
+  email          String?
+  notes          String?
+  consentAt      DateTime? @db.Timestamptz(3)
+  consentSource  String?
+  optedOutAt     DateTime? @db.Timestamptz(3)
+  archivedAt     DateTime? @db.Timestamptz(3)
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @db.Timestamptz(3)
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  leases         Lease[]
+  @@unique([organizationId, id])
+  @@index([organizationId, name])
+}
+
+model Lease {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @db.Uuid
+  roomId         String @db.Uuid
+  tenantId       String @db.Uuid
+  startsOn       DateTime @db.Date
+  endsOn         DateTime? @db.Date
+  depositPaise   Int?
+  notes          String?
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+  room           Room @relation(fields: [organizationId, roomId], references: [organizationId, id], onDelete: Restrict)
+  tenant         Tenant @relation(fields: [organizationId, tenantId], references: [organizationId, id], onDelete: Restrict)
+  terms          LeaseTerm[]
+  charges        RentCharge[]
+  payments       Payment[]
+  @@unique([organizationId, id])
+  @@index([organizationId, tenantId, startsOn])
+  @@index([organizationId, roomId, startsOn, endsOn])
+}
+
+model LeaseTerm {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @db.Uuid
+  leaseId        String @db.Uuid
+  period         DateTime @db.Date
+  amountPaise    Int
+  dueDay         Int
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+  lease          Lease @relation(fields: [organizationId, leaseId], references: [organizationId, id], onDelete: Restrict)
+  @@unique([organizationId, leaseId, period])
+}
+
+model RentCharge {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @db.Uuid
+  leaseId        String @db.Uuid
+  period         DateTime @db.Date
+  dueOn          DateTime @db.Date
+  amountPaise    Int
+  voidedAt       DateTime? @db.Timestamptz(3)
+  voidReason     String?
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+  lease          Lease @relation(fields: [organizationId, leaseId], references: [organizationId, id], onDelete: Restrict)
+  allocations    Allocation[]
+  @@unique([organizationId, leaseId, period])
+  @@unique([organizationId, leaseId, id])
+  @@index([organizationId, period, dueOn])
+}
+
+enum PaymentMode {
+  CASH
+  ONLINE
+}
+
+model Payment {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @db.Uuid
+  leaseId        String @db.Uuid
+  recordedBy     String @db.Uuid
+  amountPaise    Int
+  paidAt         DateTime @db.Timestamptz(3)
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+  mode           PaymentMode
+  reference      String?
+  source         String @default("MANUAL_UNVERIFIED")
+  notes          String?
+  key            String @db.Uuid
+  requestHash    String
+  lease          Lease @relation(fields: [organizationId, leaseId], references: [organizationId, id], onDelete: Restrict)
+  recorder       User @relation(fields: [recordedBy], references: [id], onDelete: Restrict)
+  allocations    Allocation[]
+  reversal       PaymentReversal?
+  notification   NotificationOutbox?
+  credits        CreditApplication[]
+  @@unique([organizationId, id])
+  @@unique([organizationId, leaseId, id])
+  @@unique([organizationId, key])
+  @@index([organizationId, paidAt, id])
+  @@index([organizationId, leaseId, reference])
+}
+
+model CreditApplication {
+  organizationId String @db.Uuid
+  paymentId      String @db.Uuid
+  key            String @db.Uuid
+  requestHash    String
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+  payment        Payment @relation(fields: [organizationId, paymentId], references: [organizationId, id], onDelete: Restrict)
+  @@id([organizationId, paymentId, key])
+}
+
+model Allocation {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @db.Uuid
+  leaseId        String @db.Uuid
+  paymentId      String @db.Uuid
+  chargeId       String @db.Uuid
+  amountPaise    Int
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+  payment        Payment @relation(fields: [organizationId, leaseId, paymentId], references: [organizationId, leaseId, id], onDelete: Restrict)
+  charge         RentCharge @relation(fields: [organizationId, leaseId, chargeId], references: [organizationId, leaseId, id], onDelete: Restrict)
+  @@index([organizationId, leaseId, paymentId])
+  @@index([organizationId, leaseId, chargeId])
+}
+
+model PaymentReversal {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @db.Uuid
+  paymentId      String @db.Uuid
+  actorId        String @db.Uuid
+  reason         String
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+  payment        Payment @relation(fields: [organizationId, paymentId], references: [organizationId, id], onDelete: Restrict)
+  actor          User @relation(fields: [actorId], references: [id], onDelete: Restrict)
+  @@unique([organizationId, paymentId])
+}
+
+model WhatsAppSender {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @unique @db.Uuid
+  phoneNumberId  String @unique
+  secretRef      String
+  cashTemplate   String
+  onlineTemplate String
+  language       String
+  enabled        Boolean @default(false)
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+}
+
+enum MessageStatus {
+  UNCONFIGURED
+  NO_CONSENT
+  PENDING
+  SENDING
+  ACCEPTED
+  SENT
+  DELIVERED
+  READ
+  FAILED
+  UNCERTAIN
+  SIMULATED
+  CANCELLED
+}
+
+model NotificationOutbox {
+  id               String @id @default(uuid()) @db.Uuid
+  organizationId   String @db.Uuid
+  paymentId        String @db.Uuid
+  snapshot         Json
+  status           MessageStatus
+  attempts         Int @default(0)
+  manualRetries    Int @default(0)
+  nextAt           DateTime @default(now()) @db.Timestamptz(3)
+  claimUntil       DateTime? @db.Timestamptz(3)
+  claimToken       String? @unique @db.Uuid
+  senderNumberId   String?
+  providerId       String?
+  reason           String?
+  retryable        Boolean @default(false)
+  createdAt        DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime @updatedAt @db.Timestamptz(3)
+  payment          Payment @relation(fields: [organizationId, paymentId], references: [organizationId, id], onDelete: Restrict)
+  @@unique([organizationId, paymentId])
+  @@unique([senderNumberId, providerId])
+  @@index([status, nextAt])
+  @@index([organizationId, createdAt, id])
+}
+
+model WebhookEvent {
+  fingerprint String @id
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+  @@index([createdAt])
+}
+
+model AuditLog {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @db.Uuid
+  actorId        String? @db.Uuid
+  action         String
+  entityId       String @db.Uuid
+  details        Json?
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  @@index([organizationId, createdAt, id])
+}
+
+model BillingJob {
+  organizationId String @db.Uuid
+  period         DateTime @db.Date
+  attempts       Int @default(0)
+  nextAt         DateTime @default(now()) @db.Timestamptz(3)
+  doneAt         DateTime? @db.Timestamptz(3)
+  failedAt       DateTime? @db.Timestamptz(3)
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  @@id([organizationId, period])
+  @@index([doneAt, failedAt, nextAt])
+}
+
+model BackupRun {
+  id          String @id @default(uuid()) @db.Uuid
+  startedAt   DateTime @default(now()) @db.Timestamptz(3)
+  finishedAt  DateTime? @db.Timestamptz(3)
+  status      String
+  objectKey   String?
+  monthlyKey  String?
+  bytes       BigInt?
+  sha256      String?
+  keyVersion  String?
+  reason      String?
+  @@index([status, startedAt])
+}

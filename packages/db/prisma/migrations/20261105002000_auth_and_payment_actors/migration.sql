@@ -1,0 +1,6 @@
+ALTER TABLE "TwoFactor" ADD COLUMN "failedVerificationCount" INTEGER NOT NULL DEFAULT 0,
+  ADD COLUMN "lockedUntil" TIMESTAMPTZ(3);
+ALTER TABLE "Payment" ADD CONSTRAINT "Payment_recordedBy_fkey"
+  FOREIGN KEY ("recordedBy") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "PaymentReversal" ADD CONSTRAINT "PaymentReversal_actorId_fkey"
+  FOREIGN KEY ("actorId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;

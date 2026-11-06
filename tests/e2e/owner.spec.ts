@@ -1,0 +1,73 @@
+import { randomBytes } from 'node:crypto';
+import { expect, test } from '@playwright/test';
+import { provisionOwner } from '../../scripts/owners';
+import { testDatabase } from '../local-db';
+
+test('mobile owner creates a lease, records cash and online rent, and exports only their data', async ({ page }) => {
+  const db = testDatabase();
+  const slug = randomBytes(5).toString('hex');
+  const password = randomBytes(24).toString('base64url');
+  const email = `browser-${slug}@example.test`;
+  let ownId: string;
+  let otherId: string;
+  try {
+    ownId = (await provisionOwner(db, { email, name: 'Browser owner', organization: `Browser Rentals ${slug}`, password, verified: true })).organization.id;
+    otherId = (await provisionOwner(db, { email: `other-${slug}@example.test`, name: 'Other owner', organization: 'Other Rentals', password, verified: true })).organization.id;
+    await db.property.create({ data: { name: `Other private property ${slug}`, organizationId: otherId } });
+  } finally { await db.$disconnect(); }
+
+  await page.goto('/');
+  await page.getByLabel('Email', { exact: true }).fill(email);
+  await page.getByLabel('Password', { exact: true }).fill(password);
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Dashboard' })).toBeVisible();
+  const navigate = async (label: string) => {
+    await page.getByRole('button', { name: 'Open navigation' }).click();
+    await page.getByRole('navigation', { name: 'Owner navigation' }).getByRole('link', { name: label, exact: true }).click();
+  };
+  await navigate('Properties');
+  await page.getByLabel('Name', { exact: true }).fill('Green House');
+  await page.getByRole('button', { name: 'Create property' }).click();
+  await expect(page.getByRole('button', { name: 'Green House' })).toBeVisible();
+  await navigate('Rooms');
+  await page.getByLabel('Room name or number').fill('101');
+  await page.getByRole('combobox', { name: 'Property', exact: true }).selectOption({ label: 'Green House' });
+  await page.getByLabel('Suggested rent (₹)').fill('8000');
+  await page.getByRole('button', { name: 'Create room' }).click();
+  await expect(page.getByRole('button', { name: /101/ })).toBeVisible();
+  await navigate('Tenants');
+  await page.getByLabel('Name', { exact: true }).fill('Rahul Singh');
+  await page.getByRole('button', { name: 'Create tenant' }).click();
+  await expect(page.getByRole('button', { name: /Rahul Singh/ })).toBeVisible();
+  await navigate('Leases');
+  await page.getByRole('button', { name: 'New lease' }).click();
+  await page.getByRole('combobox', { name: 'Room', exact: true }).selectOption({ label: 'Green House · 101' });
+  await page.getByRole('combobox', { name: 'Tenant', exact: true }).selectOption({ label: 'Rahul Singh' });
+  await page.getByRole('button', { name: 'Create lease' }).click();
+  await expect(page.getByRole('heading', { name: '101 · Rahul Singh' })).toBeVisible();
+  await page.getByRole('link', { name: 'Record payment' }).click();
+  await page.getByLabel('Amount received (₹)').fill('2000');
+  await page.getByLabel(/remaining of/).fill('2000');
+  page.on('dialog', async dialog => { await dialog.accept(); });
+  await page.getByRole('button', { name: 'Confirm payment' }).click();
+  await expect(page.getByRole('heading', { name: 'Payment recorded' })).toBeVisible();
+  await expect(page.getByText('Unconfigured', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Record another payment' }).click();
+  await page.getByRole('combobox', { name: 'Payment mode', exact: true }).selectOption('ONLINE');
+  await page.getByLabel('Online transaction reference').fill('0009876');
+  await page.getByLabel('Amount received (₹)').fill('6000');
+  await page.getByLabel(/remaining of/).fill('6000');
+  await page.getByRole('button', { name: 'Confirm payment' }).click();
+  await expect(page.getByRole('heading', { name: 'Payment recorded' })).toBeVisible();
+  await page.getByRole('link', { name: 'Open receipt' }).click();
+  await expect(page.getByText('0009876', { exact: true })).toBeVisible();
+  await navigate('Rent ledger');
+  await expect(page.getByText('Paid', { exact: true })).toBeVisible();
+  const csv = await page.request.get(`/api/orgs/${ownId}/exports/payments`);
+  expect(csv.ok()).toBe(true);
+  expect(await csv.text()).toContain('0009876');
+  expect((await page.request.get(`/api/orgs/${otherId}/exports/payments`)).status()).toBe(404);
+  await page.getByRole('button', { name: 'Open navigation' }).click();
+  await page.getByRole('button', { name: 'Sign out' }).click();
+  await expect(page.getByRole('heading', { name: 'Sign in to RentLedger' })).toBeVisible();
+});

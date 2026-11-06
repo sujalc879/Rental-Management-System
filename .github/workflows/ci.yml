@@ -1,0 +1,62 @@
+name: Rental management checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: postgres:17-bookworm
+        env:
+          POSTGRES_DB: rental_test
+          POSTGRES_USER: rental_test
+          POSTGRES_PASSWORD: ci_only
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U rental_test -d rental_test"
+          --health-interval 5s --health-timeout 3s --health-retries 12
+    env:
+      DIRECT_URL: postgresql://rental_test:ci_only@127.0.0.1:5432/rental_test
+      TEST_DATABASE_URL: postgresql://rental_test:ci_only@127.0.0.1:5432/rental_test
+      TEST_API_DATABASE_URL: postgresql://rental_api:ci_only@127.0.0.1:5432/rental_test
+      TEST_WORKER_DATABASE_URL: postgresql://rental_worker:ci_only@127.0.0.1:5432/rental_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.4'
+      - run: bun install --frozen-lockfile
+      - run: bun run db:validate && bun run db:generate && bun run db:deploy
+      - run: bunx prisma migrate diff --from-config-datasource --to-schema packages/db/prisma/schema.prisma --exit-code
+      - name: Configure restricted test roles
+        shell: bash
+        run: |
+          db="${{ job.services.db.id }}"
+          docker exec "$db" psql -U rental_test -d rental_test -v ON_ERROR_STOP=1 -c "CREATE ROLE rental_api LOGIN PASSWORD 'ci_only'; CREATE ROLE rental_worker LOGIN PASSWORD 'ci_only'; CREATE ROLE rental_backup LOGIN PASSWORD 'ci_only';"
+          docker exec -i "$db" psql -U rental_test -d rental_test -v api_role=rental_api -v worker_role=rental_worker -v backup_role=rental_backup -f - < scripts/db/grants.sql
+      - run: bun run lint && bun run typecheck && bun run test && bun run build
+      - run: bunx playwright install --with-deps chromium
+      - run: bun run test:e2e
+      - run: bun audit --audit-level moderate
+      - run: docker build --target app -t rentledger-test .
+      - run: docker build --target backup -t rentledger-backup-test .
+      - name: Rehearse backup and isolated restore using PostgreSQL 17 tools
+        shell: bash
+        run: |
+          mkdir -p .local/rehearsal
+          chmod 777 .local/rehearsal
+          key="$(openssl rand -hex 32)"
+          echo "::add-mask::$key"
+          docker exec "${{ job.services.db.id }}" createdb -U rental_test rental_restore_ci
+          vars=(--network host -v "$PWD/.local/rehearsal:/rehearsal" -e NODE_ENV=test -e BACKUP_ENABLED=true
+            -e BACKUP_DIRECT_URL=postgresql://rental_backup:ci_only@127.0.0.1:5432/rental_test -e BACKUP_LOCAL_DIR=/rehearsal -e BACKUP_KEY_VERSION=ci -e BACKUP_KEY="$key")
+          docker run --rm "${vars[@]}" rentledger-backup-test run --force | tee .local/backup-result.jsonl
+          object="$(jq -r 'select(.event == "backup.verified") | .dailyKey' .local/backup-result.jsonl)"
+          checksum="$(jq -r 'select(.event == "backup.verified") | .sha256' .local/backup-result.jsonl)"
+          docker run --rm "${vars[@]}" -e RESTORE_CONFIRM_DATABASE=rental_restore_ci \
+            -e RESTORE_DATABASE_URL=postgresql://rental_test:ci_only@127.0.0.1:5432/rental_restore_ci \
+            rentledger-backup-test restore "$object" "$checksum"
