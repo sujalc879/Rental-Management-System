@@ -11,6 +11,7 @@ const messagingSchema = z.object({
     META_CASH_TEMPLATE: z.string().regex(/^[a-z0-9_]+$/).optional(),
     META_ONLINE_TEMPLATE: z.string().regex(/^[a-z0-9_]+$/).optional(),
     META_TEMPLATE_LANGUAGE: z.string().regex(/^[a-z]{2}(?:_[A-Z]{2})?$/).default('en'),
+    META_TEMPLATE_LAYOUT: z.enum(['detailed_v1', 'receipt_v1']).default('detailed_v1'),
     META_OWNER_SENDERS_ENABLED: z.enum(['true', 'false']).default('false').transform(v => v === 'true'),
 });
 

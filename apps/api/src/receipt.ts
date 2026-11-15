@@ -9,6 +9,7 @@ export const receiptSchema = z.object({
   months: z.array(z.object({ period: z.string(), amountPaise: z.number().int() })), creditPaise: z.number().int(),
 });
 export type Receipt = z.infer<typeof receiptSchema>;
+export type ReceiptTemplateLayout = MessagingConfig['META_TEMPLATE_LAYOUT'];
 
 export function senderFor(config: MessagingConfig, sender: WhatsAppSender | null, mode: Receipt['mode']) {
   if (config.WHATSAPP_MODE !== 'meta' || !config.META_GRAPH_VERSION || !config.META_APP_SECRET || !config.META_VERIFY_TOKEN) return null;
@@ -17,9 +18,11 @@ export function senderFor(config: MessagingConfig, sender: WhatsAppSender | null
     if (!/^\d+$/.test(sender.phoneNumberId) || !/^[a-z0-9_]+$/.test(sender.cashTemplate) || !/^[a-z0-9_]+$/.test(sender.onlineTemplate) || !/^[a-z]{2}(?:_[A-Z]{2})?$/.test(sender.language)) return null;
     const token = process.env[sender.secretRef];
     if (!token) return null;
-    return { phoneId: sender.phoneNumberId, token, template: mode === 'CASH' ? sender.cashTemplate : sender.onlineTemplate, language: sender.language };
+    return { phoneId: sender.phoneNumberId, token, template: mode === 'CASH' ? sender.cashTemplate : sender.onlineTemplate,
+      language: sender.language, templateLayout: 'detailed_v1' as const };
   }
   const { META_PHONE_NUMBER_ID: phoneId, META_ACCESS_TOKEN: token, META_CASH_TEMPLATE, META_ONLINE_TEMPLATE } = config;
   if (!phoneId || !token || !META_CASH_TEMPLATE || !META_ONLINE_TEMPLATE) return null;
-  return { phoneId, token, template: mode === 'CASH' ? META_CASH_TEMPLATE : META_ONLINE_TEMPLATE, language: config.META_TEMPLATE_LANGUAGE };
+  return { phoneId, token, template: mode === 'CASH' ? META_CASH_TEMPLATE : META_ONLINE_TEMPLATE,
+    language: config.META_TEMPLATE_LANGUAGE, templateLayout: config.META_TEMPLATE_LAYOUT };
 }

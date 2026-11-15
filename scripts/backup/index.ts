@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { setTimeout as pause } from 'node:timers/promises';
 import { businessMonth } from '../../packages/shared/src/ledger';
 import { decryptArchive, encryptArchive, parseKey, sha256 } from './archive';
-import { command, connect, directUrl, snapshotManifest, verifyLedger } from './postgres';
+import { command, connect, directUrl, invalidateRestoredSessions, quarantineRestoredReceipts, snapshotManifest, verifyLedger } from './postgres';
 import { objectName, storage } from './storage';
 
 const production = process.env.NODE_ENV === 'production';
@@ -36,9 +36,9 @@ async function backup() {
     if (!lock.claimed) { console.log('Backup already running'); return; }
     await db.query(`UPDATE "BackupRun" SET status = 'FAILED', reason = 'INTERRUPTED', "finishedAt" = now() WHERE status = 'RUNNING'`);
     const success = store.kind === 'OFFSITE' ? 'SUCCESS' : 'LOCAL_SUCCESS';
-    const { rows: [latest] } = await db.query(`SELECT "startedAt" FROM "BackupRun" WHERE status = $1 ORDER BY "startedAt" DESC LIMIT 1`, [success]);
+    const { rows: [latest] } = await db.query(`SELECT "startedAt" FROM "BackupRun" WHERE status = $1 AND "storageId" = $2 ORDER BY "startedAt" DESC LIMIT 1`, [success, store.id]);
     const { rows: [monthly] } = await db.query(`SELECT 1 AS found FROM "BackupRun" WHERE status = $1 AND "monthlyKey" IS NOT NULL
-      AND to_char("startedAt" AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM') = $2 LIMIT 1`, [success, businessMonth()]);
+      AND to_char("startedAt" AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM') = $2 AND "storageId" = $3 LIMIT 1`, [success, businessMonth(), store.id]);
     if (!process.argv.includes('--force') && monthly && latest && Date.now() - latest.startedAt.getTime() < maxAge - 3_600_000) return;
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       const id = crypto.randomUUID();
@@ -50,7 +50,7 @@ async function backup() {
       const archive = join(dir, 'encrypted.rentbk');
       let stage = 'START';
       try {
-        await db.query(`INSERT INTO "BackupRun" (id, "startedAt", status, "keyVersion") VALUES ($1, $2, 'RUNNING', $3)`, [id, now, version]);
+        await db.query(`INSERT INTO "BackupRun" (id, "startedAt", status, "keyVersion", "storageId") VALUES ($1, $2, 'RUNNING', $3, $4)`, [id, now, version, store.id]);
         stage = 'DUMP';
         await db.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
         try {
@@ -115,9 +115,18 @@ async function restore() {
     restore.output.resume();
     await restore.done;
     await verifyLedger(db);
-    const actual = await snapshotManifest(db);
+    const actual = await snapshotManifest(db, Object.keys(manifest.counts));
     if (JSON.stringify(actual) !== JSON.stringify(manifest)) throw new Error('Restored data does not match the authenticated manifest');
-    console.log(JSON.stringify({ event: 'restore.verified', counts: actual.counts }));
+    await db.query('BEGIN');
+    let quarantinedReceipts: number;
+    let expiredAccess: { expiredSessions: string; expiredTokens: string };
+    try {
+      quarantinedReceipts = await quarantineRestoredReceipts(db);
+      expiredAccess = await invalidateRestoredSessions(db);
+      await db.query('COMMIT');
+    }
+    catch (error) { await db.query('ROLLBACK').catch(() => {}); throw error; }
+    console.log(JSON.stringify({ event: 'restore.verified', counts: actual.counts, quarantinedReceipts, ...expiredAccess }));
   } finally { await db.end().catch(() => {}); await rm(dir, { recursive: true, force: true }); }
 }
 

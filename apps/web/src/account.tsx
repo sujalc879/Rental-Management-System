@@ -4,9 +4,10 @@ import { KeyRound } from 'lucide-react';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
-import { auth, useRecords, useWrite } from './api';
-import type { Notice } from './types';
-import { ActionForm, Badge, Field, getText, localInstant, messageOf, Page, Pager, Panel, Result, Table } from './ui';
+import { messageStatuses } from '../../../packages/shared/src/input';
+import { auth, queryString, useRecords, useWrite } from './api';
+import type { MessagingHealth, Notice, OperationsHealth } from './types';
+import { ActionForm, Badge, Field, getText, localInstant, messageOf, Page, Pager, Panel, readable, Result, Table } from './ui';
 
 function checked<T>(response: { data: T | null; error: { message?: string } | null }) {
   if (response.error) throw new Error(response.error.message || 'Account request failed');
@@ -69,6 +70,7 @@ export function AuthPage({ mode }: { mode: 'sign-in' | 'recover' | 'verify' | 'r
 export function Settings() {
   const organization = useRecords<{ name: string; whatsappEnabled: boolean }>('settings');
   const backup = useRecords<{ status: string; lastSuccessAt?: string }>('backup-health');
+  const operations = useRecords<OperationsHealth>('operations-health');
   const session = auth.useSession();
   const write = useWrite();
   const [mfa, setMfa] = useState<{ totpURI: string; backupCodes: string[] } | null>(null);
@@ -77,6 +79,17 @@ export function Settings() {
     <div className="split"><Panel title="Organization"><Result busy={organization.isPending} error={organization.error}>{organization.data && <ActionForm label="Save organization" onSubmit={form => write('settings', { name: getText(form, 'name'), whatsappEnabled: form.has('whatsappEnabled') }, 'PATCH')}>
       <Field label="Organization name"><input name="name" defaultValue={organization.data.name} required maxLength={120} /></Field><label className="check"><input type="checkbox" name="whatsappEnabled" defaultChecked={organization.data.whatsappEnabled} /> Queue receipts when an approved sender is available</label>
     </ActionForm>}</Result></Panel><Panel title="Independent backups"><Result busy={backup.isPending} error={backup.error}>{backup.data && <><Badge value={backup.data.status} /><p>{backup.data.lastSuccessAt ? `Last verified backup ${localInstant(backup.data.lastSuccessAt)} IST` : 'No verified off-site backup is available to report.'}</p></>}</Result></Panel></div>
+    <Panel title="Background jobs"><Result busy={operations.isPending} error={operations.error}>{operations.data && <>
+      <p>Rent generation and receipt processing <Badge value={operations.data.worker.status} /></p>
+      <p>{operations.data.worker.lastSuccessAt ? `Last successful worker check ${localInstant(operations.data.worker.lastSuccessAt)} IST` : 'No successful worker check has been recorded.'}</p>
+      <p>{operations.data.billing.pending} rent-generation jobs pending · {operations.data.billing.failed} failed</p>
+      {operations.data.billing.failedJobs.map(job => <div key={job.period}>
+        <p>Rent month {job.period.slice(0, 7)} · {job.attempts} attempts</p>
+        <ActionForm label={`Retry ${job.period.slice(0, 7)}`} secondary onSubmit={form => write(`billing-jobs/${job.period.slice(0, 7)}/retry`, { reason: getText(form, 'reason') })}>
+          <Field label="Retry reason"><input name="reason" minLength={3} maxLength={300} required /></Field>
+        </ActionForm>
+      </div>)}
+    </>}</Result><button type="button" className="text-button" onClick={() => { void operations.refetch(); }}>Refresh job status</button></Panel>
     <div className="split"><Panel title="Account and password"><p>{session.data?.user.email}</p><ActionForm label="Change password" onSubmit={async form => {
       checked(await auth.changePassword({ currentPassword: String(form.get('current') ?? ''), newPassword: String(form.get('next') ?? ''), revokeOtherSessions: true }));
     }}><Field label="Current password"><input name="current" type="password" autoComplete="current-password" required /></Field><Field label="New password"><input name="next" type="password" autoComplete="new-password" required minLength={12} /></Field></ActionForm>
@@ -96,11 +109,24 @@ export function Settings() {
 
 export function Notifications() {
   const [offset, setOffset] = useState(0);
-  const history = useRecords<Notice[]>(`notifications?take=30&offset=${offset}`);
+  const [status, setStatus] = useState('');
+  const [search, setSearch] = useState('');
+  const health = useRecords<MessagingHealth>('messaging-health');
+  const history = useRecords<Notice[]>(`notifications${queryString({ status, q: search, take: 30, offset })}`);
   const write = useWrite();
-  return <Page title="WhatsApp receipts" description="Track queue, provider acceptance and delivery separately from the payment ledger.">
+  const descriptions = {
+    DISABLED: 'Receipts are disabled for this organization or the platform. Payments are still recorded normally.',
+    SIMULATED: 'Local development simulation is active. No real WhatsApp messages are sent.',
+    CONFIGURED: 'Sender configuration is present. Delivery still depends on provider approval, valid credentials and the recipient’s consent.',
+    UNCONFIGURED: 'An approved sender and its complete configuration are required before receipts can be sent.',
+  };
+  return <Page title="WhatsApp receipts" description="Track queue, provider acceptance and delivery separately from the payment ledger." action={<button className="button secondary" onClick={() => { void history.refetch(); void health.refetch(); }}>Refresh receipts</button>}>
+    <Panel title="Messaging setup"><Result busy={health.isPending} error={health.error}>{health.data && <><Badge value={health.data.status} /><p>{descriptions[health.data.status]}</p></>}</Result></Panel>
+    <Panel title="Filters"><div className="filters"><Field label="Receipt status"><select value={status} onChange={event => { setStatus(event.target.value); setOffset(0); }}><option value="">All receipt statuses</option>{messageStatuses.map(value => <option key={value} value={value}>{readable(value)}</option>)}</select></Field>
+      <Field label="Find tenant, room, property or payment"><input maxLength={120} value={search} onChange={event => { setSearch(event.target.value); setOffset(0); }} /></Field>
+    </div></Panel>
     <Panel title="Receipt history"><Result busy={history.isPending} error={history.error} empty={!history.data?.length}><Table headers={['Payment', 'Created (IST)', 'Status', 'Details', 'Actions']}>{history.data?.map(row => <tr key={row.id}>
-      <td><Link to={`/payments/${row.paymentId}`}>Open payment</Link></td><td>{localInstant(row.createdAt)}</td><td><Badge value={row.status} /></td><td>{row.reason?.toLowerCase().replaceAll('_', ' ') || '—'}</td>
+      <td><Link to={`/payments/${row.paymentId}`}>{row.payment.lease.tenant.name}</Link><small>{row.payment.lease.room.property.name} · {row.payment.lease.room.name}</small></td><td>{localInstant(row.createdAt)}</td><td><Badge value={row.status} /></td><td>{row.reason?.toLowerCase().replaceAll('_', ' ') || '—'}</td>
       <td>{row.status === 'FAILED' && row.retryable && row.manualRetries < 2 && <ActionForm label="Retry" secondary onSubmit={() => write(`notifications/${row.id}/retry`)} />}</td>
     </tr>)}</Table></Result><Pager count={history.data?.length ?? 0} offset={offset} onChange={setOffset} /></Panel>
   </Page>;

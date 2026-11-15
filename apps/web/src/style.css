@@ -38,6 +38,7 @@ button:disabled, select:disabled, fieldset:disabled { opacity: .62; cursor: defa
 .stack > .panel { margin: 0; }
 .panel h2 { margin-bottom: .65rem; }
 .panel p { margin: .55rem 0; }
+.panel ol { list-style: decimal; padding-left: 1.25rem; line-height: 1.8; margin: .5rem 0; }
 .button { display: inline-flex; align-items: center; justify-content: center; gap: .4rem; min-height: 42px; border-radius: .55rem; padding: .55rem .9rem; background: #236048; border: 1px solid #236048; color: #fff; text-decoration: none; font-size: .9rem; font-weight: 650; }
 .button:hover { background: #194a37; }
 .button.secondary { background: #fff; color: #245642; border-color: #abc2b1; }
@@ -84,6 +85,7 @@ td details { min-width: 8rem; margin-top: .3rem; }
 .details { display: grid; grid-template-columns: auto 1fr; gap: .35rem .8rem; font-size: .88rem; }
 .details dt { font-weight: 650; }
 .details dd { overflow-wrap: anywhere; }
+.audit-detail { display: contents; }
 .auth-screen { min-height: 100vh; display: grid; }
 .auth-side { background: #173529; color: #fff; padding: 1.5rem; display: grid; align-content: center; justify-items: start; gap: .65rem; }
 .auth-side p { color: #dce9dd; }

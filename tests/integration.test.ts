@@ -1,4 +1,5 @@
 import { createHmac, randomBytes } from 'node:crypto';
+import { Client } from 'pg';
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,8 +8,10 @@ import { createApp } from '../apps/api/src/app';
 import { readConfig } from '../apps/api/src/config';
 import { dispatchOne, recoverExpiredClaims } from '../apps/api/src/messaging';
 import { runBillingJob, scheduleBilling } from '../apps/worker/src/billing';
-import { businessDay, businessMonth, monthKey, periodDate, shiftMonth } from '../packages/shared/src/ledger';
+import { recordWorkerHeartbeat, workerHeartbeatName } from '../apps/api/src/operations';
+import { businessDay, businessMonth, dateInputToUtc, monthKey, periodDate, shiftMonth } from '../packages/shared/src/ledger';
 import { provisionOwner } from '../scripts/owners';
+import { invalidateRestoredSessions, quarantineRestoredReceipts } from '../scripts/backup/postgres';
 import { testDatabase } from './local-db';
 
 const db = testDatabase();
@@ -49,18 +52,19 @@ async function successful(response: Response, status = 200) {
 async function addOwner(label: string) {
   const email = `${label}-${slug}@example.test`;
   const { user, organization } = await provisionOwner(db, { name: label, email, password, organization: `Rentals ${label} ${slug}`, verified: true });
-  const signIn = await request('/api/auth/sign-in/email', 'POST', { email, password });
+  const clientIp = [127, ...randomBytes(3)].join('.');
+  const signIn = await request('/api/auth/sign-in/email', 'POST', { email, password }, '', app, { 'x-rental-client-ip': clientIp });
   const cookies = cookie(signIn);
   await successful(signIn);
   expect(cookies).toContain('session_token=');
   return { id: organization.id, userId: user.id, cookies };
 }
-async function fixture(owner: Owner, label: string): Promise<Fixture> {
+async function fixture(owner: Owner, label: string, startsOn = `${businessMonth()}-01`): Promise<Fixture> {
   const property = (await successful(await call(owner, 'properties', 'POST', { name: `${label} property ${slug}` }), 201)).id;
   const room = (await successful(await call(owner, 'rooms', 'POST', { name: label, propertyId: property }), 201)).id;
   const tenant = (await successful(await call(owner, 'tenants', 'POST', { name: `${label} tenant ${slug}`, whatsapp: '+919876543210' }), 201)).id;
   await successful(await call(owner, `tenants/${tenant}/consent`, 'POST', { allowed: true, source: 'Test record of opt-in' }));
-  const lease = (await successful(await call(owner, 'leases', 'POST', { roomId: room, tenantId: tenant, startsOn: `${businessMonth()}-01`, amountPaise: 800_000, dueDay: 5 }), 201)).id;
+  const lease = (await successful(await call(owner, 'leases', 'POST', { roomId: room, tenantId: tenant, startsOn, amountPaise: 800_000, dueDay: 5 }), 201)).id;
   const charge = (await successful(await call(owner, `ledger?leaseId=${lease}`)))[0].id;
   return { property, room, tenant, lease, charge };
 }
@@ -89,6 +93,13 @@ afterAll(async () => {
 });
 
 describe('organization authorization and authentication', () => {
+  test('rate-limits repeated sign-in attempts without disabling limits for fixture creation', async () => {
+    const ip = [127, ...randomBytes(3)].join('.');
+    for (let attempt = 0; attempt < 10; attempt++) {
+      expect((await request('/api/auth/sign-in/email', 'POST', { email: `missing-${slug}@example.test`, password }, '', app, { 'x-rental-client-ip': ip })).status).toBe(401);
+    }
+    expect((await request('/api/auth/sign-in/email', 'POST', { email: `missing-${slug}@example.test`, password }, '', app, { 'x-rental-client-ip': ip })).status).toBe(429);
+  });
   test('denies protected access without a valid verified session and rejects cross-origin writes', async () => {
     expect((await request(route(ownerA, 'ledger'))).status).toBe(401);
     expect((await request(route(ownerA, 'properties'), 'POST', { name: 'Injected' }, ownerA.cookies, app, { origin: 'https://evil.example' })).status).toBe(403);
@@ -126,12 +137,18 @@ describe('organization authorization and authentication', () => {
     const verify = (await mails()).find(row => row.to === email && row.subject.includes('Verify'));
     expect((await app.request(verify.url)).status).toBe(302);
     expect((await db.user.findUniqueOrThrow({ where: { id: account.user.id } })).emailVerified).toBe(true);
+    expect(await db.auditLog.count({ where: { organizationId: account.organization.id, actorId: account.user.id, action: 'account.email_verified' } })).toBe(1);
     await successful(await request('/api/auth/request-password-reset', 'POST', { email, redirectTo: `${origin}/reset` }));
     const reset = (await mails()).find(row => row.to === email && row.subject.includes('password'));
     const redirect = (await app.request(reset.url)).headers.get('location');
     const token = new URL(redirect!).searchParams.get('token');
     const newPassword = `${password}-reset`;
+    const otherPasswordEvents = await db.auditLog.count({ where: { organizationId: { not: account.organization.id }, action: 'account.password_updated' } });
+    const passwordEvents = () => db.auditLog.findMany({ where: { organizationId: account.organization.id, action: 'account.password_updated' } });
     await successful(await request('/api/auth/reset-password', 'POST', { token, newPassword }));
+    expect(await passwordEvents()).toMatchObject([{ actorId: account.user.id, entityId: account.user.id }]);
+    expect((await request('/api/auth/reset-password', 'POST', { token, newPassword })).status).toBe(400);
+    expect(await passwordEvents()).toHaveLength(1);
     expect((await request('/api/auth/sign-in/email', 'POST', { email, password })).status).toBe(401);
     const signedIn = await request('/api/auth/sign-in/email', 'POST', { email, password: newPassword });
     const cookies = cookie(signedIn);
@@ -141,8 +158,13 @@ describe('organization authorization and authentication', () => {
     const second = await request('/api/auth/sign-in/email', 'POST', { email, password: newPassword });
     const secondCookie = cookie(second);
     await successful(second);
-    await successful(await request('/api/auth/sign-out', 'POST', {}, secondCookie));
-    expect((await request('/api/organizations', 'GET', undefined, secondCookie)).status).toBe(401);
+    const changed = await request('/api/auth/change-password', 'POST', { currentPassword: newPassword, newPassword: `${newPassword}-changed`, revokeOtherSessions: true }, secondCookie);
+    await successful(changed);
+    expect(await passwordEvents()).toHaveLength(2);
+    expect(await db.auditLog.count({ where: { organizationId: { not: account.organization.id }, action: 'account.password_updated' } })).toBe(otherPasswordEvents);
+    const activeCookies = cookie(changed) || secondCookie;
+    await successful(await request('/api/auth/sign-out', 'POST', {}, activeCookies));
+    expect((await request('/api/organizations', 'GET', undefined, activeCookies)).status).toBe(401);
   });
 
   test('enrolls TOTP and keeps a password-only MFA sign-in out of the owner API', async () => {
@@ -276,5 +298,228 @@ describe('durable receipts and webhook isolation', () => {
     expect(await db.notificationOutbox.findUniqueOrThrow({ where: { id: row.id } })).toMatchObject({ status: 'PENDING', attempts: 0, manualRetries: 1 });
     await db.notificationOutbox.update({ where: { id: row.id }, data: { status: 'FAILED', attempts: 5, manualRetries: 2, retryable: true } });
     expect((await call(ownerB, `notifications/${row.id}/retry`, 'POST', {}, metaApp)).status).toBe(409);
+  });
+  test('uses the committed payment ID and approved field order when dispatching receipt templates', async () => {
+    const owner = await addOwner('receipt-owner');
+    const data = await fixture(owner, 'Receipt101');
+    await successful(await call(owner, 'settings', 'PATCH', { name: 'Receipt owner', whatsappEnabled: true }));
+    const compact = { ...meta, META_TEMPLATE_LAYOUT: 'receipt_v1' as const };
+    const use = createApp(apiDb, compact).app;
+    for (const mode of ['CASH', 'ONLINE'] as const) {
+      const amountPaise = mode === 'CASH' ? 12_345 : 20_001;
+      const reference = mode === 'ONLINE' ? '000UPI123' : undefined;
+      const recorded = (await successful(await call(owner, 'payments', 'POST', payment(data, amountPaise, { mode, reference }), use), 201)).payment;
+      await db.notificationOutbox.updateMany({ where: {
+        organizationId: { in: [ownerA.id, ownerB.id, owner.id] }, claimToken: { not: null },
+      }, data: { updatedAt: new Date(0) } });
+      let payload: { template: { components: { parameters: { text: string }[] }[] } } | undefined;
+      const stub: typeof fetch = Object.assign(async (_input: string | URL | Request, options?: RequestInit) => {
+        payload = JSON.parse(String(options?.body));
+        return Response.json({ messages: [{ id: `wamid.receipt-${recorded.id}` }] });
+      }, { preconnect: fetch.preconnect });
+      expect(await dispatchOne(workerDb, compact, stub)).toBe(true);
+      const values = payload!.template.components[0].parameters.map(value => value.text);
+      expect(values).toHaveLength(mode === 'CASH' ? 6 : 7);
+      expect(values[0]).toBe(`Receipt101 tenant ${slug}`);
+      expect(values[1]).toBe(mode === 'CASH' ? '123.45' : '200.01');
+      expect(values[2]).toContain(`Owner: Receipt owner; Property: Receipt101 property ${slug}; Rent: ${businessMonth()}`);
+      expect(values[3]).toBe('Receipt101');
+      expect(values[4]).toBe(recorded.id);
+      if (mode === 'ONLINE') expect(values[5]).toBe('000UPI123');
+      expect(values.at(-1)).toContain('IST');
+      const row = await db.notificationOutbox.findUniqueOrThrow({ where: { id: recorded.notification.id } });
+      expect(row.status).toBe('ACCEPTED');
+      expect(values[4]).not.toBe(row.claimToken);
+    }
+  });
+});
+
+describe('operational health and preserved lease history', () => {
+  test('scopes failed jobs, denies cross-owner retries, and audits authorized retries', async () => {
+    const owner = await addOwner('operations-owner');
+    const other = await addOwner('operations-other');
+    const month = monthKey(shiftMonth(periodDate(businessMonth()), -1));
+    const otherMonth = monthKey(shiftMonth(periodDate(businessMonth()), -2));
+    await db.billingJob.createMany({ data: [
+      { organizationId: owner.id, period: periodDate(month), attempts: 5, failedAt: new Date() },
+      { organizationId: other.id, period: periodDate(otherMonth), attempts: 5, failedAt: new Date() },
+    ] });
+    await db.workerHeartbeat.upsert({ where: { name: workerHeartbeatName },
+      create: { name: workerHeartbeatName, lastSucceededAt: new Date(0) }, update: { lastSucceededAt: new Date(0) },
+    });
+    const health = await successful(await call(owner, 'operations-health'));
+    expect(health.worker.status).toBe('OVERDUE');
+    expect(health.billing).toMatchObject({ failed: 1, pending: 0 });
+    expect(health.billing.failedJobs.map((job: { period: string }) => job.period.slice(0, 7))).toEqual([month]);
+    expect((await request(route(other, 'operations-health'), 'GET', undefined, owner.cookies)).status).toBe(404);
+    expect((await call(owner, `billing-jobs/${otherMonth}/retry`, 'POST', { reason: 'Forged month' })).status).toBe(404);
+    expect((await request(route(other, `billing-jobs/${otherMonth}/retry`), 'POST', { reason: 'Forged organization' }, owner.cookies)).status).toBe(404);
+    await successful(await call(owner, `billing-jobs/${month}/retry`, 'POST', { reason: 'Operator fixed the cause' }));
+    expect((await call(owner, `billing-jobs/${month}/retry`, 'POST', { reason: 'Repeated request' })).status).toBe(409);
+    expect(await db.auditLog.count({ where: { organizationId: owner.id, action: 'billing.retried' } })).toBe(1);
+    expect(await db.billingJob.findUniqueOrThrow({ where: { organizationId_period: { organizationId: other.id, period: periodDate(otherMonth) } } })).toMatchObject({ attempts: 5 });
+    await recordWorkerHeartbeat(workerDb);
+    expect((await successful(await call(owner, 'operations-health'))).worker.status).toBe('HEALTHY');
+    await expect(apiDb.workerHeartbeat.update({ where: { name: workerHeartbeatName }, data: { lastSucceededAt: new Date(0) } })).rejects.toBeDefined();
+  });
+
+  test('preserves paid months and snapshots when rent changes, leases end and occupants change', async () => {
+    const owner = await addOwner('history-owner');
+    const month = businessMonth();
+    const next = monthKey(shiftMonth(periodDate(month), 1));
+    const previous = monthKey(shiftMonth(periodDate(month), -1));
+    const data = await fixture(owner, 'History101', `${previous}-01`);
+    await successful(await call(owner, `rooms/${data.room}`, 'PATCH', { propertyId: data.property, name: 'History101', suggestedPaise: 950_000, suggestedDay: 10 }));
+    expect((await successful(await call(owner, `ledger?leaseId=${data.lease}`)))[0].amountPaise).toBe(800_000);
+    await successful(await call(owner, `leases/${data.lease}/terms`, 'POST', { month: next, amountPaise: 900_000, dueDay: 31, reason: 'Future rent change' }), 201);
+    await successful(await call(owner, 'ledger/generate', 'POST', { month: next, leaseId: data.lease }));
+    const future = (await successful(await call(owner, `ledger?leaseId=${data.lease}&month=${next}`)))[0];
+    expect(future.amountPaise).toBe(900_000);
+    expect((await call(owner, `leases/${data.lease}/end`, 'POST', { endsOn: businessDay(), reason: 'Tenant moving out' })).status).toBe(409);
+    const receipt = (await successful(await call(owner, 'payments', 'POST', payment(data, 800_000, {
+      paidAt: dateInputToUtc(`${previous}-28T12:00`),
+    })), 201)).payment;
+    expect((await successful(await call(owner, `dashboard?month=${previous}`))).received).toBe('800000');
+    expect((await successful(await call(owner, `dashboard?month=${month}`)))).toMatchObject({ received: '0', applied: '800000' });
+    await successful(await call(owner, `ledger/${future.id}/void`, 'POST', { reason: 'Unused month after move-out' }));
+    await successful(await call(owner, `leases/${data.lease}/end`, 'POST', { endsOn: businessDay(), reason: 'Tenant moving out' }));
+    await successful(await call(owner, `tenants/${data.tenant}/archive`, 'POST'));
+    const replacement = (await successful(await call(owner, 'tenants', 'POST', { name: 'Replacement tenant' }), 201)).id;
+    await successful(await call(owner, 'leases', 'POST', { roomId: data.room, tenantId: replacement, startsOn: businessDay(), amountPaise: 1_000_000, dueDay: 5, depositPaise: 500_000 }), 201);
+    const room = (await successful(await call(owner, 'rooms'))).find((row: { id: string }) => row.id === data.room);
+    expect(room.leases[0].tenant.name).toBe('Replacement tenant');
+    expect((await call(owner, `rooms/${data.room}/archive`, 'POST')).status).toBe(409);
+    const history = await successful(await call(owner, `ledger?leaseId=${data.lease}&month=${month}`));
+    expect(history[0]).toMatchObject({ amountPaise: 800_000, allocatedPaise: 800_000, status: 'PAID' });
+    expect((await successful(await call(owner, `payments/${receipt.id}`))).notification.snapshot.room).toBe('History101');
+    await expect(db.rentCharge.delete({ where: { id: data.charge } })).rejects.toBeDefined();
+    const allocation = await db.allocation.findFirstOrThrow({ where: { paymentId: receipt.id } });
+    await expect(db.allocation.update({ where: { id: allocation.id }, data: { amountPaise: 1 } })).rejects.toBeDefined();
+  });
+
+  test('holds restored receipts for reconciliation without changing money or duplicating audit events', async () => {
+    const owner = await addOwner('recovery-owner');
+    const data = await fixture(owner, 'Recovery101');
+    await successful(await call(owner, 'settings', 'PATCH', { name: 'Recovery Rentals', whatsappEnabled: true }));
+    const receipt = (await successful(await call(owner, 'payments', 'POST', payment(data, 1000), metaApp), 201)).payment;
+    expect(receipt.notification.status).toBe('PENDING');
+    const client = new Client({ connectionString: process.env.TEST_DATABASE_URL });
+    try {
+      await client.connect();
+      await client.query('BEGIN');
+      expect(await quarantineRestoredReceipts(client)).toBeGreaterThan(0);
+      expect((await client.query('SELECT status, reason, retryable FROM "NotificationOutbox" WHERE id = $1', [receipt.notification.id])).rows[0])
+        .toEqual({ status: 'UNCERTAIN', reason: 'RESTORE_RECONCILIATION_REQUIRED', retryable: false });
+      expect((await client.query('SELECT "amountPaise" FROM "Payment" WHERE id = $1', [receipt.id])).rows[0].amountPaise).toBe(1000);
+      expect((await client.query('SELECT count(*)::int AS n FROM "AuditLog" WHERE "entityId" = $1 AND action = $2', [receipt.notification.id, 'notification.recovery_hold'])).rows[0].n).toBe(1);
+      expect(await quarantineRestoredReceipts(client)).toBe(0);
+      await client.query('INSERT INTO "Verification" (id, identifier, value, "expiresAt", "updatedAt") VALUES ($1, $2, $3, $4, $5)',
+        [crypto.randomUUID(), 'recovery-test-link', 'synthetic-one-time-token', new Date(Date.now() + 60_000), new Date()]);
+      const expired = await invalidateRestoredSessions(client);
+      expect(BigInt(expired.expiredSessions)).toBeGreaterThan(0n);
+      expect(BigInt(expired.expiredTokens)).toBeGreaterThan(0n);
+      expect((await client.query('SELECT count(*)::int AS n FROM "Session"')).rows[0].n).toBe(0);
+      expect((await client.query('SELECT count(*)::int AS n FROM "Verification"')).rows[0].n).toBe(0);
+      expect(await invalidateRestoredSessions(client)).toEqual({ expiredSessions: '0', expiredTokens: '0' });
+      expect((await client.query('SELECT "amountPaise" FROM "Payment" WHERE id = $1', [receipt.id])).rows[0].amountPaise).toBe(1000);
+    } finally { await client.query('ROLLBACK'); await client.end(); }
+    expect((await db.notificationOutbox.findUniqueOrThrow({ where: { id: receipt.notification.id } })).status).toBe('PENDING');
+    await db.notificationOutbox.update({ where: { id: receipt.notification.id }, data: { status: 'CANCELLED', reason: 'TEST_COMPLETE' } });
+  });
+});
+
+describe('owner activity, receipt filters and occupancy history', () => {
+  test('scopes and redacts activity while applying inclusive IST dates and stable pagination', async () => {
+    const owner = await addOwner('activity-owner');
+    const other = await addOwner('activity-other');
+    const entityId = crypto.randomUUID();
+    await db.auditLog.createMany({ data: [
+      { organizationId: owner.id, entityId, action: 'payment.recorded', createdAt: new Date('2024-01-01T18:29:59.999Z') },
+      { organizationId: owner.id, entityId, actorId: owner.userId, action: 'payment.recorded', createdAt: new Date('2024-01-01T18:30:00.000Z'), details: { amountPaise: 10, accessToken: 'secret-not-for-owner-response', nested: { password: 'private' } } },
+      { organizationId: owner.id, entityId, action: 'payment.recorded', createdAt: new Date('2024-01-02T18:29:59.999Z'), details: { amountPaise: 20 } },
+      { organizationId: owner.id, entityId, action: 'payment.recorded', createdAt: new Date('2024-01-02T18:30:00.000Z') },
+      { organizationId: other.id, entityId, action: 'payment.recorded', createdAt: new Date('2024-01-01T19:00:00.000Z'), details: { reason: 'OTHER_ORGANIZATION_PRIVATE_ACTIVITY' } },
+    ] });
+    const path = `audit?category=payment&q=payment%20recorded&entityId=${entityId}&from=2024-01-02&to=2024-01-02`;
+    const events = await successful(await call(owner, path));
+    expect(events).toHaveLength(2);
+    expect(events.map((event: { details: { amountPaise: number } }) => event.details.amountPaise)).toEqual([20, 10]);
+    expect(JSON.stringify(events)).not.toMatch(/secret-not-for-owner-response|accessToken|password|nested|OTHER_ORGANIZATION/);
+    expect(events[0]).not.toHaveProperty('organizationId');
+    const first = await successful(await call(owner, `${path}&take=1`));
+    const second = await successful(await call(owner, `${path}&take=1&offset=1`));
+    expect([first[0].id, second[0].id]).toEqual(events.map((event: { id: string }) => event.id));
+    expect((await request(route(other, 'audit'), 'GET', undefined, owner.cookies)).status).toBe(404);
+    expect((await call(owner, 'audit?from=2024-01-03&to=2024-01-02')).status).toBe(400);
+    expect((await call(owner, 'audit?category=unknown')).status).toBe(400);
+    expect((await call(owner, 'audit', 'POST', { action: 'erase.history' })).status).toBe(404);
+  });
+
+  test('filters receipts without exposing other owners, snapshots or sender credentials', async () => {
+    const owner = await addOwner('receipt-filter-owner');
+    const other = await addOwner('receipt-filter-other');
+    const data = await fixture(owner, 'Filter101');
+    const privateData = await fixture(other, 'Filter101');
+    const disabled = (await successful(await call(owner, 'payments', 'POST', payment(data, 1000)), 201)).payment;
+    await successful(await call(owner, 'settings', 'PATCH', { name: 'Filter Rentals', whatsappEnabled: true }));
+    const queued = (await successful(await call(owner, 'payments', 'POST', payment(data, 1000)), 201)).payment;
+    await successful(await call(other, 'settings', 'PATCH', { name: 'Other Filter Rentals', whatsappEnabled: true }));
+    const foreign = (await successful(await call(other, 'payments', 'POST', payment(privateData, 1000)), 201)).payment;
+    const rows = await successful(await call(owner, 'notifications?status=PENDING&q=Filter101'));
+    expect(rows.map((row: { paymentId: string }) => row.paymentId)).toEqual([queued.id]);
+    expect(rows[0].payment.lease.tenant.name).toBe(`Filter101 tenant ${slug}`);
+    expect(rows[0]).not.toHaveProperty('snapshot');
+    expect(rows[0]).not.toHaveProperty('providerId');
+    expect(JSON.stringify(rows)).not.toContain('919876543210');
+    expect((await successful(await call(owner, `notifications?q=${foreign.id}`)))).toEqual([]);
+    expect((await successful(await call(owner, 'notifications?status=UNCONFIGURED')))[0].paymentId).toBe(disabled.id);
+    expect((await call(owner, 'notifications?status=NOT_A_STATE')).status).toBe(400);
+    expect((await request(route(other, 'messaging-health'), 'GET', undefined, owner.cookies)).status).toBe(404);
+    expect(await successful(await call(owner, 'messaging-health'))).toEqual({ status: 'SIMULATED' });
+    expect(await successful(await call(owner, 'messaging-health', 'GET', undefined, metaApp))).toEqual({ status: 'CONFIGURED' });
+    const missingCredentials = createApp(apiDb, { ...meta, META_ACCESS_TOKEN: undefined }).app;
+    expect(await successful(await call(owner, 'messaging-health', 'GET', undefined, missingCredentials))).toEqual({ status: 'UNCONFIGURED' });
+    await successful(await call(owner, 'settings', 'PATCH', { name: 'Filter Rentals', whatsappEnabled: false }));
+    expect(await successful(await call(owner, 'messaging-health', 'GET', undefined, metaApp))).toEqual({ status: 'DISABLED' });
+  });
+
+  test('reports historical occupancy from recorded room availability with exclusive move-out and scoped filters', async () => {
+    const owner = await addOwner('occupancy-owner');
+    const other = await addOwner('occupancy-other');
+    const current = businessMonth();
+    const previous = monthKey(shiftMonth(periodDate(current), -1));
+    const opening = monthKey(shiftMonth(periodDate(current), -2));
+    const beforeOpening = monthKey(shiftMonth(periodDate(current), -3));
+    const data = await fixture(owner, 'Occupancy101', `${opening}-01`);
+    const foreign = await fixture(other, 'Occupancy101', `${opening}-01`);
+    const unused = await successful(await call(owner, `ledger?leaseId=${data.lease}`));
+    for (const charge of unused.filter((row: { month: string }) => row.month >= previous)) {
+      await successful(await call(owner, `ledger/${charge.id}/void`, 'POST', { reason: 'Unused rent after historic move-out' }));
+    }
+    await successful(await call(owner, `leases/${data.lease}/end`, 'POST', { endsOn: `${previous}-01`, reason: 'Historic move-out' }));
+    const replacement = (await successful(await call(owner, 'tenants', 'POST', { name: 'Occupancy replacement' }), 201)).id;
+    await successful(await call(owner, 'leases', 'POST', { roomId: data.room, tenantId: replacement, startsOn: `${previous}-01`, amountPaise: 900_000, dueDay: 5 }), 201);
+    const vacant = (await successful(await call(owner, 'rooms', 'POST', { propertyId: data.property, name: 'Newly recorded vacant room' }), 201)).id;
+    for (const month of [opening, previous]) {
+      const summary = await successful(await call(owner, `dashboard?month=${month}`));
+      expect(summary).toMatchObject({ rooms: 1, occupied: 1, vacant: 0, activeTenants: 1 });
+      expect(summary.occupancy).toHaveLength(1);
+      expect(summary.occupancy[0]).toMatchObject({ month, rooms: 1, occupied: 1, vacant: 0 });
+    }
+    const summary = await successful(await call(owner, `dashboard?month=${current}`));
+    expect(summary).toMatchObject({ rooms: 2, occupied: 1, vacant: 1, activeTenants: 1 });
+    expect(summary.occupancy[0].asOf).toBe(businessDay());
+    expect((await successful(await call(owner, `dashboard?month=${beforeOpening}`))).rooms).toBe(0);
+    const former = await successful(await call(owner, `dashboard?month=${previous}&tenantId=${data.tenant}`));
+    expect(former).toMatchObject({ rooms: 0, occupied: 0, vacant: 0 });
+    expect((await successful(await call(owner, `dashboard?month=${opening}&tenantId=${data.tenant}`))).occupied).toBe(1);
+    const year = await successful(await call(owner, `dashboard?year=${current.slice(0, 4)}`));
+    expect(year.occupancy.at(-1)).toMatchObject({ month: current, rooms: 2, occupied: 1, vacant: 1 });
+    expect(year.occupancy).toHaveLength(Number(current.slice(5)));
+    const future = monthKey(shiftMonth(periodDate(current), 1));
+    expect((await successful(await call(owner, `dashboard?month=${future}`))).occupancy).toEqual([]);
+    expect((await call(owner, `dashboard?roomId=${foreign.room}`)).status).toBe(404);
+    await successful(await call(owner, `rooms/${vacant}/archive`, 'POST'));
+    expect((await successful(await call(owner, `dashboard?month=${current}`))).rooms).toBe(1);
   });
 });

@@ -23,6 +23,10 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s CMD bun -e 'process.exit((await fetch("http://127.0.0.1:" + (process.env.API_PORT || "3000") + "/ready")).ok ? 0 : 1)'
 CMD ["bun", "apps/api/src/server.ts"]
 
+FROM app AS worker
+HEALTHCHECK NONE
+CMD ["bun", "apps/worker/src/index.ts"]
+
 FROM postgres:17-bookworm AS backup
 COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 COPY --from=build /app /app

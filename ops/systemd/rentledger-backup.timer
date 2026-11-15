@@ -1,0 +1,11 @@
+[Unit]
+Description=Check RentLedger independent backup schedule hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=60
+Unit=rentledger-backup.service
+
+[Install]
+WantedBy=timers.target

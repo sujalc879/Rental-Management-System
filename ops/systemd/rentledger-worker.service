@@ -1,0 +1,21 @@
+[Unit]
+Description=RentLedger durable billing and receipt worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=rentledger
+WorkingDirectory=/opt/rentledger
+EnvironmentFile=/etc/rentledger/worker.env
+ExecStart=/usr/local/bin/bun run worker
+Restart=always
+RestartSec=5
+TimeoutStopSec=35
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

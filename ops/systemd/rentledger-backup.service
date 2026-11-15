@@ -1,0 +1,19 @@
+[Unit]
+Description=RentLedger independent encrypted backup
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=rentledger
+WorkingDirectory=/opt/rentledger
+EnvironmentFile=/etc/rentledger/backup.env
+Environment=BACKUP_SCRATCH_DIR=/var/lib/rentledger-backup
+StateDirectory=rentledger-backup
+ExecStart=/usr/local/bin/bun run backup run
+TimeoutStartSec=3h
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+UMask=0077

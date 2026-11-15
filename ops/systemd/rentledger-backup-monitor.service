@@ -1,0 +1,17 @@
+[Unit]
+Description=Check RentLedger off-site backup age
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=rentledger
+WorkingDirectory=/opt/rentledger
+EnvironmentFile=/etc/rentledger/monitor.env
+ExecStart=/usr/local/bin/bun run backup monitor
+TimeoutStartSec=60
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+UMask=0077

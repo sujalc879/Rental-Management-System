@@ -1,11 +1,12 @@
 import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '../generated/client';
+import { databaseUrl } from './connection';
 
 export function openDatabase(connectionString = process.env.DATABASE_URL) {
   if (!connectionString || !/^postgres(?:ql)?:\/\//.test(connectionString)) {
     throw new Error('A PostgreSQL DATABASE_URL is required');
   }
-  const url = new URL(connectionString);
+  const url = databaseUrl(connectionString);
   if (!url.hostname || !url.pathname.slice(1)) throw new Error('DATABASE_URL must name a PostgreSQL database');
   if (process.env.NODE_ENV === 'production' && !['require', 'verify-ca', 'verify-full'].includes(url.searchParams.get('sslmode') ?? '')) {
     throw new Error('Production DATABASE_URL must require TLS');

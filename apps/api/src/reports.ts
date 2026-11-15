@@ -1,7 +1,7 @@
 import type { z } from 'zod';
 import { Prisma } from '../../../packages/db/generated/client';
 import type { reportInput } from '../../../packages/shared/src/input';
-import { businessDay, businessMonth, calendarDate, dateInputToUtc, monthKey, periodDate, shiftMonth } from '../../../packages/shared/src/ledger';
+import { businessDay, businessMonth, dateInputToUtc, monthKey, periodDate, shiftMonth } from '../../../packages/shared/src/ledger';
 import { DomainError, missing, type Scope, type Tx } from './domain';
 
 export type Filters = z.infer<typeof reportInput>;
@@ -83,24 +83,47 @@ export function payments(tx: Tx, scope: Scope, filters: Filters, exportRows = fa
   });
 }
 
+type OccupancyPoint = { month: string; asOf: string; rooms: number; occupied: number; vacant: number; activeTenants: number };
+
+export function occupancyHistory(tx: Tx, scope: Scope, filters: Filters) {
+  const current = businessMonth();
+  const start = filters.month ?? (filters.year ? `${filters.year}-01` : monthKey(shiftMonth(periodDate(current), -11)));
+  const end = filters.month ?? (filters.year ? `${filters.year}-12` : current);
+  return tx.$queryRaw<OccupancyPoint[]>`WITH snapshots AS (
+    SELECT period, LEAST((period + interval '1 month' - interval '1 day')::date, ${businessDay()}::date) AS day
+    FROM generate_series(${`${start}-01`}::timestamp, ${`${end}-01`}::timestamp, interval '1 month') period
+    WHERE period <= ${`${current}-01`}::date
+  ) SELECT to_char(s.period, 'YYYY-MM') AS month, to_char(s.day, 'YYYY-MM-DD') AS "asOf", totals.*
+    FROM snapshots s CROSS JOIN LATERAL (
+      SELECT count(DISTINCT r.id)::int AS rooms,
+        (count(DISTINCT r.id) FILTER (WHERE l.id IS NOT NULL))::int AS occupied,
+        (count(DISTINCT r.id) FILTER (WHERE l.id IS NULL))::int AS vacant,
+        count(DISTINCT t.id)::int AS "activeTenants"
+      FROM "Room" r JOIN "Property" p ON (p."organizationId", p.id) = (r."organizationId", r."propertyId")
+      LEFT JOIN "Lease" l ON (l."organizationId", l."roomId") = (r."organizationId", r.id)
+        AND l."startsOn" <= s.day AND (l."endsOn" IS NULL OR l."endsOn" > s.day)
+      LEFT JOIN "Tenant" t ON (t."organizationId", t.id) = (l."organizationId", l."tenantId")
+      WHERE r."organizationId" = ${scope.organizationId}::uuid
+        AND LEAST((r."createdAt" AT TIME ZONE 'Asia/Kolkata')::date, COALESCE((
+          SELECT min(history."startsOn") FROM "Lease" history
+          WHERE (history."organizationId", history."roomId") = (r."organizationId", r.id)
+        ), (r."createdAt" AT TIME ZONE 'Asia/Kolkata')::date)) <= s.day
+        AND (r."archivedAt" IS NULL OR r."archivedAt" >= ((s.day + 1)::timestamp AT TIME ZONE 'Asia/Kolkata'))
+        ${filters.roomId ? Prisma.sql`AND r.id = ${filters.roomId}::uuid` : Prisma.empty}
+        ${filters.propertyId ? Prisma.sql`AND p.id = ${filters.propertyId}::uuid` : Prisma.empty}
+        ${filters.tenantId ? Prisma.sql`AND t.id = ${filters.tenantId}::uuid` : Prisma.empty}
+        ${filters.leaseId ? Prisma.sql`AND l.id = ${filters.leaseId}::uuid` : Prisma.empty}
+        ${filters.q ? Prisma.sql`AND (strpos(lower(t.name), lower(${filters.q})) > 0 OR strpos(lower(r.name), lower(${filters.q})) > 0 OR strpos(lower(p.name), lower(${filters.q})) > 0)` : Prisma.empty}
+    ) totals ORDER BY s.period`;
+}
+
 export async function dashboard(tx: Tx, scope: Scope, filters: Filters) {
   const period = filters.month ?? (filters.year ? undefined : businessMonth());
   const selection = { ...filters, month: period };
   const range = periodRange(selection);
   const organizationId = scope.organizationId;
-  const today = calendarDate(businessDay());
-  const occupancyDate = range && (period !== businessMonth() && filters.year !== businessMonth().slice(0, 4))
-    ? calendarDate(`${range[1]}-01`) : today;
-  if (occupancyDate !== today) occupancyDate.setUTCDate(0);
-  const archiveCutoff = new Date(dateInputToUtc(`${occupancyDate.toISOString().slice(0, 10)}T23:59:59.999`));
-  const currentLease: Prisma.LeaseWhereInput = { organizationId, startsOn: { lte: occupancyDate },
-    OR: [{ endsOn: null }, { endsOn: { gt: occupancyDate } }], tenantId: filters.tenantId, id: filters.leaseId };
-  const roomWhere: Prisma.RoomWhereInput = { organizationId, propertyId: filters.propertyId, id: filters.roomId,
-    OR: [{ archivedAt: null }, { archivedAt: { gt: archiveCutoff } }],
-  };
-  const rooms = await tx.room.count({ where: roomWhere });
-  const occupied = await tx.room.count({ where: { ...roomWhere, leases: { some: currentLease } } });
-  const activeTenants = await tx.tenant.count({ where: { organizationId, id: filters.tenantId, leases: { some: { ...currentLease, room: roomWhere } } } });
+  const occupancy = await occupancyHistory(tx, scope, selection);
+  const { rooms = 0, occupied = 0, vacant = 0, activeTenants = 0 } = occupancy.at(-1) ?? {};
   const summary = await tx.$queryRaw<{ expected: string; applied: string; outstanding: string; overdue: string }[]>`${ledgerCte(scope, selection)}
       SELECT COALESCE(SUM("amountPaise") FILTER (WHERE status <> 'VOID'), 0)::text AS expected,
         COALESCE(SUM("allocatedPaise"), 0)::text AS applied, COALESCE(SUM("outstandingPaise"), 0)::text AS outstanding,
@@ -131,7 +154,7 @@ export async function dashboard(tx: Tx, scope: Scope, filters: Filters) {
     SELECT month, SUM("amountPaise")::text AS expected, SUM("allocatedPaise")::text AS applied FROM ledger WHERE status <> 'VOID'
       AND month BETWEEN ${monthKey(shiftMonth(periodDate(period ?? `${filters.year ?? businessMonth().slice(0, 4)}-12`), -11))} AND ${period ?? `${filters.year ?? businessMonth().slice(0, 4)}-12`}
       GROUP BY month ORDER BY month`;
-  return { month: period, year: filters.year, rooms, occupied, vacant: rooms - occupied, activeTenants, ...summary[0],
+  return { month: period, year: filters.year, rooms, occupied, vacant, activeTenants, occupancy, ...summary[0],
     received: cashModes.reduce((sum, row) => sum + BigInt(row.amount), 0n).toString(), cashModes, recentPayments, notices, upcoming, byRoom, trend };
 }
 

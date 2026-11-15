@@ -15,12 +15,15 @@ GRANT UPDATE ("endsOn") ON "Lease" TO :"api_role";
 GRANT UPDATE ("voidedAt", "voidReason") ON "RentCharge" TO :"api_role";
 GRANT UPDATE (status, attempts, "manualRetries", "nextAt", "claimUntil", "claimToken", "providerId", reason, retryable, "updatedAt") ON "NotificationOutbox" TO :"api_role";
 GRANT SELECT (status, "startedAt") ON "BackupRun" TO :"api_role";
+GRANT SELECT ON "BillingJob", "WorkerHeartbeat" TO :"api_role";
+GRANT UPDATE (attempts, "nextAt", "failedAt") ON "BillingJob" TO :"api_role";
 
 GRANT SELECT ON "Organization", "BillingJob", "Property", "Room", "Tenant", "Lease", "LeaseTerm", "RentCharge", "Payment", "PaymentReversal", "WhatsAppSender", "NotificationOutbox", "AuditLog" TO :"worker_role";
 GRANT UPDATE ("updatedAt") ON "Organization" TO :"worker_role";
 GRANT INSERT, UPDATE ON "BillingJob" TO :"worker_role";
 GRANT INSERT ON "RentCharge", "AuditLog" TO :"worker_role";
 GRANT UPDATE (status, attempts, "nextAt", "claimUntil", "claimToken", "senderNumberId", "providerId", reason, retryable, "updatedAt") ON "NotificationOutbox" TO :"worker_role";
+GRANT SELECT, INSERT, UPDATE ON "WorkerHeartbeat" TO :"worker_role";
 
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO :"backup_role";
 GRANT INSERT, UPDATE ON "BackupRun" TO :"backup_role";

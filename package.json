@@ -13,7 +13,11 @@
     "dev:api": "bun --watch apps/api/src/server.ts",
     "dev:web": "vite --config apps/web/vite.config.ts",
     "worker": "bun apps/worker/src/index.ts",
+    "worker:monitor": "bun scripts/monitor-worker.ts",
     "backup": "bun scripts/backup/index.ts",
+    "verify:recovery": "bun scripts/verify-recovery.ts",
+    "verify:local": "bash scripts/verify-local.sh",
+    "verify:containers": "bash scripts/verify-containers.sh",
     "onboard": "bun scripts/onboard.ts",
     "seed:dev": "bun scripts/seed.ts",
     "db:generate": "prisma generate",
@@ -23,7 +27,7 @@
     "lint": "eslint apps packages scripts tests *.ts",
     "test": "vitest run --config vitest.config.ts",
     "test:e2e": "playwright test",
-    "build": "vite build --config apps/web/vite.config.ts"
+    "build": "NODE_ENV=production vite build --config apps/web/vite.config.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.1162.0",

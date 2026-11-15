@@ -4,7 +4,7 @@ import type { MessageStatus, NotificationOutbox } from '../../../packages/db/gen
 import type { Database } from '../../../packages/db/src/index';
 import { businessTimeZone, inr } from '../../../packages/shared/src/ledger';
 import { atomic, audit, conflict, hash, missing, type Scope, type Tx } from './domain';
-import { receiptSchema, senderFor, type Receipt } from './receipt';
+import { receiptSchema, senderFor, type Receipt, type ReceiptTemplateLayout } from './receipt';
 import type { MessagingConfig } from './config';
 
 const maximumAttempts = 5;
@@ -12,11 +12,19 @@ const maximumManualRetries = 2;
 const localTime = new Intl.DateTimeFormat('en-IN', { timeZone: businessTimeZone, dateStyle: 'medium', timeStyle: 'short' });
 const safeText = (value: string) => value.replace(/[\p{Cc}\p{Cf}]/gu, ' ').replace(/\s+/gu, ' ').trim();
 
-export function receiptParameters(receipt: Receipt) {
+export function receiptParameters(receipt: Receipt, layout: ReceiptTemplateLayout = 'detailed_v1', paymentId?: string) {
   const months = receipt.months.map(row => `${row.period} ${inr(row.amountPaise)}`).join(', ');
   const coverage = [months, receipt.creditPaise ? `Advance credit ${inr(receipt.creditPaise)}` : ''].filter(Boolean).join(' · ');
+  const paidAt = `${localTime.format(new Date(receipt.paidAt))} IST`;
+  if (layout === 'receipt_v1') {
+    const receiptNumber = z.uuid().parse(paymentId);
+    const context = `Owner: ${receipt.owner}; Property: ${receipt.property}; Rent: ${coverage}`;
+    return [receipt.tenant, inr(receipt.amountPaise).replace('₹', ''), context, receipt.room, receiptNumber,
+      ...(receipt.mode === 'ONLINE' ? [receipt.reference!] : []), paidAt,
+    ].map(safeText);
+  }
   return [receipt.tenant, receipt.owner, receipt.property, receipt.room, coverage, inr(receipt.amountPaise),
-    `${localTime.format(new Date(receipt.paidAt))} IST`, ...(receipt.mode === 'ONLINE' ? [receipt.reference!] : []),
+    paidAt, ...(receipt.mode === 'ONLINE' ? [receipt.reference!] : []),
   ].map(safeText);
 }
 
@@ -84,14 +92,17 @@ export async function receiveWebhook(db: Database, config: MessagingConfig, requ
 type SendResult = { status: 'ACCEPTED' | 'SIMULATED' | 'UNCERTAIN' | 'FAILED'; providerId?: string; reason?: string; retryable?: boolean };
 type Sender = NonNullable<ReturnType<typeof senderFor>>;
 
-export async function sendMeta(version: string, sender: Sender, receipt: Receipt, token: string, send = fetch): Promise<SendResult> {
+export async function sendMeta(version: string, sender: Sender, receipt: Receipt, token: string, send = fetch, paymentId?: string): Promise<SendResult> {
+  let parameters: string[];
+  try { parameters = receiptParameters(receipt, sender.templateLayout, paymentId); }
+  catch { return { status: 'FAILED', reason: 'META_INVALID_RECEIPT', retryable: false }; }
   try {
     const response = await send(`https://graph.facebook.com/${version}/${sender.phoneId}/messages`, {
       method: 'POST', redirect: 'error', headers: { Authorization: `Bearer ${sender.token}`, 'Content-Type': 'application/json' },
       signal: AbortSignal.timeout(12_000),
       body: JSON.stringify({ messaging_product: 'whatsapp', recipient_type: 'individual', to: receipt.whatsapp!.slice(1), type: 'template',
         biz_opaque_callback_data: token, template: { name: sender.template, language: { code: sender.language },
-          components: [{ type: 'body', parameters: receiptParameters(receipt).map(text => ({ type: 'text', text })) }],
+          components: [{ type: 'body', parameters: parameters.map(text => ({ type: 'text', text })) }],
         },
       }),
     });
@@ -171,11 +182,11 @@ export async function dispatchOne(db: Database, config: MessagingConfig, send = 
     const changed = await tx.notificationOutbox.updateMany({ where: { ...claimed, status: 'SENDING', claimToken: token, claimUntil: { gt: new Date() } },
       data: { senderNumberId: sender?.phoneId ?? null },
     });
-    return changed.count ? { receipt, sender, mock, attempts: row.attempts } : null;
+    return changed.count ? { receipt, sender, mock, attempts: row.attempts, paymentId: row.paymentId } : null;
   });
   if (!prepared) return true;
   const result: SendResult = prepared.mock ? { status: 'SIMULATED', reason: 'LOCAL_MOCK_NO_DELIVERY' }
-    : await sendMeta(config.META_GRAPH_VERSION!, prepared.sender!, prepared.receipt, token, send);
+    : await sendMeta(config.META_GRAPH_VERSION!, prepared.sender!, prepared.receipt, token, send, prepared.paymentId);
   const automaticRetry = result.retryable && prepared.attempts < maximumAttempts;
   const status = automaticRetry ? 'PENDING' : result.status;
   await db.$transaction(async tx => {

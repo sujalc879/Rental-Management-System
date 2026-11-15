@@ -43,6 +43,7 @@ jobs:
       - run: bun run test:e2e
       - run: bun audit --audit-level moderate
       - run: docker build --target app -t rentledger-test .
+      - run: docker build --target worker -t rentledger-worker-test .
       - run: docker build --target backup -t rentledger-backup-test .
       - name: Rehearse backup and isolated restore using PostgreSQL 17 tools
         shell: bash

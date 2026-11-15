@@ -43,6 +43,12 @@ export const pageInput = z.strictObject({
   offset: z.coerce.number().int().min(0).max(100_000).default(0),
   q: z.string().trim().max(120).optional(),
 });
+export const messageStatuses = ['UNCONFIGURED', 'NO_CONSENT', 'PENDING', 'SENDING', 'ACCEPTED', 'SENT', 'DELIVERED', 'READ', 'FAILED', 'UNCERTAIN', 'SIMULATED', 'CANCELLED'] as const;
+export const notificationInput = pageInput.extend({ status: z.enum(messageStatuses).optional() });
+export const auditCategories = ['payment', 'charge', 'lease', 'room', 'tenant', 'property', 'account', 'organization', 'notification', 'billing'] as const;
+export const auditInput = pageInput.extend({
+  category: z.enum(auditCategories).optional(), entityId: id.optional(), from: day.optional(), to: day.optional(),
+}).refine(value => !value.from || !value.to || value.from <= value.to, { path: ['to'], message: 'End date must follow the start date' });
 export const reportInput = pageInput.extend({
   month: month.optional(), year: z.string().regex(/^(19\d\d|20\d\d|21\d\d)$/).optional(),
   roomId: id.optional(), propertyId: id.optional(), tenantId: id.optional(), leaseId: id.optional(),

@@ -1,8 +1,9 @@
 import { defineConfig } from 'prisma/config';
 import 'dotenv/config';
+import { databaseUrl } from './packages/db/src/connection';
 
 const directUrl = process.env.DIRECT_URL;
-if (directUrl && new URL(directUrl).hostname.includes('-pooler')) {
+if (directUrl && databaseUrl(directUrl).hostname.includes('-pooler')) {
   throw new Error('DIRECT_URL must use the direct Neon endpoint for Prisma migrations');
 }
 

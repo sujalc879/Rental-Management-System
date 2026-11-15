@@ -3,16 +3,17 @@ import { bodyLimit } from 'hono/body-limit';
 import { secureHeaders } from 'hono/secure-headers';
 import { z } from 'zod';
 import type { Database } from '../../../packages/db/src/index';
-import { consentInput, creditInput, endInput, generateInput, id, leaseInput, name, pageInput, paymentInput, propertyInput, reason, reportInput, roomInput, tenantInput, termInput } from '../../../packages/shared/src/input';
-import { businessDay, businessMonth, calendarDate, periodDate } from '../../../packages/shared/src/ledger';
+import { auditInput, consentInput, creditInput, endInput, generateInput, id, leaseInput, month, name, notificationInput, pageInput, paymentInput, propertyInput, reason, reportInput, roomInput, tenantInput, termInput } from '../../../packages/shared/src/input';
+import { businessDay, businessMonth, calendarDate, dateInputToUtc, periodDate } from '../../../packages/shared/src/ledger';
 import { createAuth } from './auth';
 import type { Config } from './config';
 import { atomic, audit, DomainError, missing, type Scope } from './domain';
 import { receiveWebhook, retryNotification, verifyWebhook } from './messaging';
 import { applyCredit, recordPayment, reversePayment, voidCharge } from './payments';
-import { receiptSchema } from './receipt';
+import { receiptSchema, senderFor } from './receipt';
 import { dashboard, exportCsv, ledger, payments, verifyFilters } from './reports';
 import { archiveRental, changeConsent, changeTerms, createLease, endLease, generateMonth, saveProperty, saveRoom, saveTenant } from './rentals';
+import { operationsHealth, retryBillingJob } from './operations';
 
 type Variables = { actorId: string; scope: Scope };
 type ApiContext = Context<{ Variables: Variables }>;
@@ -20,6 +21,12 @@ const routeId = (c: ApiContext, field = 'id') => id.parse(c.req.param(field));
 const scopeOf = (c: ApiContext) => c.get('scope');
 const asReason = z.strictObject({ reason });
 const appSettings = z.strictObject({ name, whatsappEnabled: z.boolean() });
+const auditDetailFields = new Set(['amountPaise', 'mode', 'termId', 'reason', 'endsOn', 'status', 'errorCode', 'referenceAcknowledged', 'consentCleared', 'whatsappEnabled', 'reversalId', 'period', 'month']);
+function publicAuditDetails(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return Object.fromEntries(Object.entries(value).filter(([key, detail]) => auditDetailFields.has(key) &&
+    (detail === null || ['string', 'number', 'boolean'].includes(typeof detail))));
+}
 
 async function body<T>(c: ApiContext, schema: z.ZodType<T>): Promise<T> {
   if (c.req.header('content-type')?.split(';')[0].trim().toLowerCase() !== 'application/json') throw new DomainError(415, 'Send an application/json request');
@@ -95,6 +102,13 @@ export function createApp(db: Database, config: Config) {
   const missingIfNull = <T>(result: T | null) => { if (!result) throw missing(); return result; };
 
   app.get(`${base}/settings`, async c => c.json(await db.organization.findUniqueOrThrow({ where: { id: scopeOf(c).organizationId }, select: { name: true, whatsappEnabled: true } })));
+  app.get(`${base}/messaging-health`, async c => {
+    const organization = await db.organization.findUniqueOrThrow({ where: { id: scopeOf(c).organizationId }, include: { sender: true } });
+    const status = !organization.whatsappEnabled || config.WHATSAPP_MODE === 'disabled' ? 'DISABLED'
+      : config.WHATSAPP_MODE === 'mock' ? 'SIMULATED'
+      : senderFor(config, organization.sender, 'CASH') && senderFor(config, organization.sender, 'ONLINE') ? 'CONFIGURED' : 'UNCONFIGURED';
+    return c.json({ status });
+  });
   app.patch(`${base}/settings`, async c => {
     const input = await body(c, appSettings);
     const scope = scopeOf(c);
@@ -203,17 +217,38 @@ export function createApp(db: Database, config: Config) {
     return c.body(content, 200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="rental-${kind}.csv"` });
   });
   app.get(`${base}/notifications`, async c => {
-    const { take, offset } = page(c);
-    return c.json(await db.notificationOutbox.findMany({ where: { organizationId: scopeOf(c).organizationId },
-      select: { id: true, paymentId: true, status: true, reason: true, retryable: true, manualRetries: true, attempts: true, createdAt: true, updatedAt: true },
+    const { take, offset, status, q } = notificationInput.parse(c.req.query());
+    return c.json(await db.notificationOutbox.findMany({ where: { organizationId: scopeOf(c).organizationId, status,
+      OR: q ? [
+        { payment: { lease: { tenant: { name: contains(q) } } } },
+        { payment: { lease: { room: { name: contains(q) } } } },
+        { payment: { lease: { room: { property: { name: contains(q) } } } } },
+        ...(id.safeParse(q).success ? [{ paymentId: q }] : []),
+      ] : undefined,
+    },
+      select: { id: true, paymentId: true, status: true, reason: true, retryable: true, manualRetries: true, attempts: true, createdAt: true, updatedAt: true,
+        payment: { select: { lease: { select: { tenant: { select: { name: true } }, room: { select: { name: true, property: { select: { name: true } } } } } } } },
+      },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take, skip: offset,
     }));
   });
   app.post(`${base}/notifications/:id/retry`, async c => c.json(await retryNotification(db, config, scopeOf(c), routeId(c))));
   app.get(`${base}/audit`, async c => {
-    const { take, offset } = page(c);
-    return c.json(await db.auditLog.findMany({ where: { organizationId: scopeOf(c).organizationId }, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take, skip: offset }));
+    const { take, offset, q, category, entityId, from, to } = auditInput.parse(c.req.query());
+    const events = await db.auditLog.findMany({ where: {
+      organizationId: scopeOf(c).organizationId, entityId,
+      AND: [
+        ...(category ? [{ action: { startsWith: `${category}.` } }] : []),
+        ...(q ? q.split(/\s+/).map(word => ({ action: { contains: word, mode: 'insensitive' as const } })) : []),
+      ],
+      createdAt: { gte: from ? new Date(dateInputToUtc(`${from}T00:00:00`)) : undefined,
+        lt: to ? new Date(new Date(dateInputToUtc(`${to}T00:00:00`)).getTime() + 86_400_000) : undefined },
+    }, select: { id: true, actorId: true, action: true, entityId: true, details: true, createdAt: true },
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take, skip: offset });
+    return c.json(events.map(event => ({ ...event, details: publicAuditDetails(event.details) })));
   });
+  app.get(`${base}/operations-health`, c => operationsHealth(db, scopeOf(c)).then(data => c.json(data)));
+  app.post(`${base}/billing-jobs/:month/retry`, async c => c.json(await retryBillingJob(db, scopeOf(c), month.parse(c.req.param('month')), (await body(c, asReason)).reason)));
   app.get(`${base}/backup-health`, async c => {
     if (!config.BACKUP_ENABLED) return c.json({ status: 'UNCONFIGURED' });
     const last = await db.backupRun.findFirst({ where: { status: 'SUCCESS' }, orderBy: { startedAt: 'desc' }, select: { startedAt: true } });

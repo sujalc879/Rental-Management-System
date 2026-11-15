@@ -4,7 +4,9 @@ export type Room = Row & { propertyId: string; property: { name: string }; sugge
 export type Tenant = Row & { phone: string | null; whatsapp: string | null; email: string | null; archivedAt: string | null; consentAt: string | null; optedOutAt: string | null; consentSource: string | null };
 export type Lease = { id: string; roomId: string; tenantId: string; startsOn: string; endsOn: string | null; depositPaise: number | null; room: { name: string }; tenant: { name: string }; terms: { id: string; period: string; amountPaise: number; dueDay: number }[] };
 export type Charge = { id: string; leaseId: string; month: string; dueOn: string; amountPaise: number; allocatedPaise: number; outstandingPaise: number; overdue: boolean; status: string; tenant: string; room: string; property: string };
-export type Notice = { id: string; paymentId: string; status: string; reason: string | null; retryable: boolean; manualRetries: number; attempts: number; createdAt: string };
+export type Notice = { id: string; paymentId: string; status: string; reason: string | null; retryable: boolean; manualRetries: number; attempts: number; createdAt: string; payment: Pick<Payment, 'lease'> };
+export type MessagingHealth = { status: 'DISABLED' | 'SIMULATED' | 'CONFIGURED' | 'UNCONFIGURED' };
+export type AuditEvent = { id: string; actorId: string | null; action: string; entityId: string; details: Record<string, string | number | boolean | null> | null; createdAt: string };
 export type Payment = { id: string; leaseId: string; paidAt: string; amountPaise: number; mode: 'CASH' | 'ONLINE'; reference: string | null; source: string; reversal: { createdAt: string } | null; notification: { id: string; status: string } | null; lease: { tenant: { name: string }; room: { name: string; property: { name: string } } } };
 export type PaymentDetails = Pick<Payment, 'id' | 'leaseId' | 'paidAt' | 'amountPaise' | 'mode' | 'reference' | 'source'> & {
   notes: string | null; creditPaise: number; reversal: { createdAt: string; reason: string } | null;
@@ -14,4 +16,9 @@ export type PaymentDetails = Pick<Payment, 'id' | 'leaseId' | 'paidAt' | 'amount
 export type Summary = { expected: string; applied: string; outstanding: string; overdue: string; received: string; rooms: number; occupied: number; vacant: number; activeTenants: number;
   cashModes: { mode: string; amount: string }[]; notices: { status: string; _count: { _all: number } }[]; upcoming: Charge[]; recentPayments: Payment[];
   byRoom: { property: string; room: string; roomId: string; amount: string; outstanding: string }[]; trend: { month: string; expected: string; applied: string }[];
+  occupancy: { month: string; asOf: string; rooms: number; occupied: number; vacant: number; activeTenants: number }[];
+};
+export type OperationsHealth = {
+  worker: { status: 'HEALTHY' | 'OVERDUE' | 'UNAVAILABLE'; lastSuccessAt: string | null };
+  billing: { pending: number; failed: number; failedJobs: { period: string; attempts: number; failedAt: string }[] };
 };

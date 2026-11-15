@@ -6,6 +6,7 @@ import { twoFactor } from 'better-auth/plugins';
 import nodemailer from 'nodemailer';
 import type { Database } from '../../../packages/db/src/index';
 import type { Config } from './config';
+import { id } from '../../../packages/shared/src/input';
 
 export function createAuth(db: Database, config: Config) {
   const production = config.NODE_ENV === 'production';
@@ -27,6 +28,10 @@ export function createAuth(db: Database, config: Config) {
   }
 
   async function accountAudit(userId: string, action: string) {
+    if (!id.safeParse(userId).success) {
+      console.error(JSON.stringify({ event: 'account.audit_write_failed', action, code: 'INVALID_ACTOR' }));
+      return;
+    }
     try {
       const memberships = await db.membership.findMany({ where: { userId, role: 'OWNER' }, select: { organizationId: true } });
       if (memberships.length) await db.auditLog.createMany({ data: memberships.map(({ organizationId }) => ({ organizationId, actorId: userId, action, entityId: userId })) });
@@ -58,6 +63,7 @@ export function createAuth(db: Database, config: Config) {
       minPasswordLength: 12,
       revokeSessionsOnPasswordReset: true,
       sendResetPassword: ({ user, url }) => send(user.email, 'Set your RentLedger password', url),
+      onPasswordReset: ({ user }) => accountAudit(user.id, 'account.password_updated'),
     },
     emailVerification: {
       sendOnSignIn: false,
@@ -74,7 +80,7 @@ export function createAuth(db: Database, config: Config) {
         }
       } } },
       account: { update: { after: async (account, context) => {
-        if (context?.path === '/change-password' || context?.path === '/reset-password') await accountAudit(account.userId, 'account.password_updated');
+        if (context?.path === '/change-password') await accountAudit(account.userId, 'account.password_updated');
       } } },
       session: {
         create: { after: session => accountAudit(session.userId, 'account.session_created') },

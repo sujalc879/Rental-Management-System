@@ -1,0 +1,11 @@
+[Unit]
+Description=Monitor RentLedger backup age every fifteen minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Persistent=true
+Unit=rentledger-backup-monitor.service
+
+[Install]
+WantedBy=timers.target

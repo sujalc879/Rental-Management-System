@@ -2,7 +2,7 @@ import { lazy, StrictMode, Suspense, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from '@tanstack/react-query';
 import { BrowserRouter, Link, Navigate, NavLink, Route, Routes, useLocation } from 'react-router-dom';
-import { Building2, ClipboardList, DoorOpen, FileSpreadsheet, KeyRound, LayoutDashboard, LogOut, Menu, MessageCircle, ReceiptText, Settings2, Users, Wallet, X } from 'lucide-react';
+import { Building2, ClipboardList, DoorOpen, FileSpreadsheet, History, KeyRound, LayoutDashboard, LogOut, Menu, MessageCircle, ReceiptText, Settings2, Users, Wallet, X } from 'lucide-react';
 import { api, auth, Organization } from './api';
 import { Field, Result } from './ui';
 import './style.css';
@@ -16,12 +16,13 @@ const ReceiptPage = lazy(() => import('./financial-pages').then(module => ({ def
 const Reports = lazy(() => import('./financial-pages').then(module => ({ default: module.Reports })));
 const Leases = lazy(() => import('./rental-pages').then(module => ({ default: module.Leases })));
 const Rentals = lazy(() => import('./rental-pages').then(module => ({ default: module.Rentals })));
+const Activity = lazy(() => import('./activity').then(module => ({ default: module.Activity })));
 
 const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: 15_000, refetchOnWindowFocus: true } } });
 const links = [
   ['/', 'Dashboard', LayoutDashboard], ['/properties', 'Properties', Building2], ['/rooms', 'Rooms', DoorOpen], ['/tenants', 'Tenants', Users],
   ['/leases', 'Leases', ClipboardList], ['/ledger', 'Rent ledger', ReceiptText], ['/payments', 'Payments', Wallet], ['/notifications', 'WhatsApp', MessageCircle],
-  ['/reports', 'Reports', FileSpreadsheet], ['/settings', 'Settings', Settings2],
+  ['/reports', 'Reports', FileSpreadsheet], ['/activity', 'Activity log', History], ['/settings', 'Settings', Settings2],
 ] as const;
 
 function OwnerApp() {
@@ -58,7 +59,7 @@ function OwnerApp() {
       <Route path="tenants" element={<Rentals key="tenants" kind="tenants" />} /><Route path="leases" element={<Leases key={location.search.replace(/([?&])id=[^&]*/, '$1')} />} />
       <Route path="ledger" element={<Reports key={`ledger${location.search}`} view="ledger" />} /><Route path="payments" element={<Reports key="payments" view="payments" />} />
       <Route path="payments/new" element={<NewPayment key={location.search} />} /><Route path="payments/:id" element={<ReceiptPage />} /><Route path="notifications" element={<Notifications />} />
-      <Route path="reports" element={<Reports key={`reports${location.search}`} view="reports" />} /><Route path="settings" element={<Settings />} /><Route path="*" element={<p>Page not found. <Link to="/">Return to dashboard</Link></p>} />
+      <Route path="reports" element={<Reports key={`reports${location.search}`} view="reports" />} /><Route path="activity" element={<Activity />} /><Route path="settings" element={<Settings />} /><Route path="*" element={<p>Page not found. <Link to="/">Return to dashboard</Link></p>} />
     </Routes></Suspense></Organization.Provider> : <p className="empty">No owner organization is assigned to your account.</p>}</Result></main>
   </div>;
 }

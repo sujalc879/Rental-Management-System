@@ -3,6 +3,7 @@ import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { businessMonth, dateInputToUtc, inr, rupeesToPaise } from '../../../packages/shared/src/ledger';
 import { paymentInput } from '../../../packages/shared/src/input';
 import { ApiError, orgPath, queryString, useOrg, useRecords, useWrite } from './api';
+import { allocateOldest, allocationSummary } from './allocation';
 import type { Charge, Lease, Payment, PaymentDetails, Property, Room, Summary, Tenant } from './types';
 import { ActionForm, Amount, Badge, Field, getText, localInstant, messageOf, money, optionalText, Page, Pager, Panel, Result, Table } from './ui';
 
@@ -31,9 +32,13 @@ export function Dashboard() {
   return <Page title="Dashboard" description="Review rent, collections and occupancy across your properties." action={<Link className="button" to="/payments/new">Record payment</Link>}>
     <div className="filters standalone"><Field label="Reporting month"><input type="month" value={month} onChange={event => setMonth(event.target.value)} /></Field></div>
     <Result busy={dashboard.isPending} error={dashboard.error}>{data && <>
+      {!data.rooms && <Panel title="Set up your rental records"><p>Start with your building, then connect each occupied room to a tenant through a lease.</p>
+        <ol><li><Link to="/properties">Add your property</Link></li><li><Link to="/rooms">Add rooms and suggested rent</Link></li><li><Link to="/tenants">Add your tenants</Link></li><li><Link to="/leases">Create leases with agreed rent and move-in dates</Link></li></ol>
+        <p>The rent ledger will show the months owed. Record payments you have actually received, including any historical payments for past move-in dates.</p>
+      </Panel>}
       <div className="metrics">
         {[['Expected rent', data.expected], ['Rent applied', data.applied], ['Money received', data.received], ['Outstanding rent', data.outstanding], ['Overdue rent', data.overdue]].map(([label, amount]) => <div key={label} className="metric"><span>{label}</span><strong>{inr(amount)}</strong></div>)}
-        <div className="metric"><span>Occupancy</span><strong>{data.occupied} / {data.rooms}</strong><small>{data.vacant} vacant · {data.activeTenants} active tenants</small></div>
+        <div className="metric"><span>Occupancy</span><strong>{data.occupied} / {data.rooms}</strong><small>{data.vacant} vacant · {data.activeTenants} active tenants</small>{data.occupancy.at(-1) && <small>As of {data.occupancy.at(-1)!.asOf}</small>}</div>
       </div>
       <div className="split"><Panel title="Rent applied by billing month">
         {!data.trend.length && <p className="empty">No billing months yet.</p>}
@@ -95,6 +100,12 @@ export function Reports({ view }: { view: 'ledger' | 'payments' | 'reports' }) {
     {view === 'reports' && <Result busy={report.isPending} error={report.error}>{report.data && <Panel title="Period totals"><div className="metrics">
       {[['Money received', report.data.received], ['Rent expected', report.data.expected], ['Rent applied', report.data.applied], ['Outstanding', report.data.outstanding], ['Overdue', report.data.overdue], ...report.data.cashModes.map(row => [`${row.mode === 'CASH' ? 'Cash' : 'Online'} received`, row.amount])].map(([label, amount]) => <div className="metric" key={label}><span>{label}</span><strong>{inr(amount)}</strong></div>)}
     </div></Panel>}</Result>}
+    {view === 'reports' && <Result busy={report.isPending} error={report.error}>{report.data && <Panel title="Occupancy history">
+      <p>Month-end snapshots; the current month is shown as of today. Rooms enter history when first recorded or first leased, whichever is earlier. Tenant and lease filters include matching active occupants.</p>
+      <Result busy={false} empty={!report.data.occupancy.length}><Table headers={['Month', 'As of', 'Rooms', 'Occupied', 'Vacant', 'Active tenants']}>
+        {report.data.occupancy.map(row => <tr key={row.month}><td>{row.month}</td><td>{row.asOf}</td><td>{row.rooms}</td><td>{row.occupied}</td><td>{row.vacant}</td><td>{row.activeTenants}</td></tr>)}
+      </Table></Result>
+    </Panel>}</Result>}
     {view === 'ledger' && <Panel title="Generate charges"><ActionForm label="Generate rent charges" secondary onSubmit={form => write('ledger/generate', { month: getText(form, 'month'), leaseId: leaseId || undefined })} success="Month processed. Existing charges were kept.">
       <Field label="Month to generate"><input type="month" name="month" defaultValue={month || businessMonth()} required /></Field>
     </ActionForm></Panel>}
@@ -104,9 +115,10 @@ export function Reports({ view }: { view: 'ledger' | 'payments' | 'reports' }) {
   </Page>;
 }
 
-function AllocationFields({ rows }: { rows: Charge[] }) {
+function AllocationFields({ rows, values, onChange }: { rows: Charge[]; values?: Record<string, string>; onChange?: (id: string, value: string) => void }) {
   return <div className="allocations">{rows.filter(row => row.outstandingPaise > 0).map(row => <div key={row.id}>
-    <Field label={`${row.month} · ${inr(row.outstandingPaise)} remaining of ${inr(row.amountPaise)}`}><input name={`charge:${row.id}`} inputMode="decimal" placeholder="₹ 0.00" /></Field>
+    <Field label={`${row.month} · ${inr(row.outstandingPaise)} remaining of ${inr(row.amountPaise)}`}><input name={`charge:${row.id}`} inputMode="decimal" placeholder="₹ 0.00"
+      value={values ? values[row.id] ?? '' : undefined} onChange={onChange ? event => onChange(row.id, event.target.value) : undefined} /></Field>
     <small>Due {row.dueOn} · {inr(row.allocatedPaise)} already applied</small>
   </div>)}</div>;
 }
@@ -121,6 +133,9 @@ export function NewPayment() {
   const [leaseId, setLease] = useState(params.get('leaseId') || '');
   const [mode, setMode] = useState<'CASH' | 'ONLINE'>('CASH');
   const [leaseSearch, setLeaseSearch] = useState('');
+  const [amount, setAmount] = useState('');
+  const [allocationValues, setAllocationValues] = useState<Record<string, string>>({});
+  const [allowCredit, setAllowCredit] = useState(false);
   const [state, setState] = useState({ error: '', busy: false, duplicate: false });
   const [done, setDone] = useState<{ id: string; status?: string } | null>(null);
   const key = useRef(crypto.randomUUID());
@@ -128,6 +143,7 @@ export function NewPayment() {
   const leases = useRecords<Lease[]>(`leases${queryString({ take: 200, q: leaseSearch })}`);
   const selected = useRecords<Lease>(`leases/${leaseId}`, !!leaseId);
   const charges = useRecords<Charge[]>(`ledger?leaseId=${leaseId}&take=200`, !!leaseId);
+  const summary = allocationSummary(amount, allocationValues, charges.data ?? [], allowCredit);
   const write = useWrite();
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -148,22 +164,32 @@ export function NewPayment() {
     finally { submitting.current = false; setState(value => ({ ...value, busy: false })); }
   }
   return <Page title="Record payment" description="Record the money received and choose how to apply it to rent.">
-    {done ? <Panel title="Payment recorded"><p role="status">The payment is saved in the ledger.</p><p>WhatsApp receipt <Badge value={done.status ?? 'UNCONFIGURED'} /></p><div className="actions"><Link className="button" to={`/payments/${done.id}`}>Open receipt</Link><button className="button secondary" onClick={() => { key.current = crypto.randomUUID(); setState({ error: '', busy: false, duplicate: false }); setDone(null); }}>Record another payment</button></div></Panel> :
+    {done ? <Panel title="Payment recorded"><p role="status">The payment is saved in the ledger.</p><p>WhatsApp receipt <Badge value={done.status ?? 'UNCONFIGURED'} /></p><div className="actions"><Link className="button" to={`/payments/${done.id}`}>Open receipt</Link><button className="button secondary" onClick={() => { key.current = crypto.randomUUID(); setState({ error: '', busy: false, duplicate: false }); setAmount(''); setAllocationValues({}); setAllowCredit(false); setDone(null); }}>Record another payment</button></div></Panel> :
       <Panel title="Payment details"><form onSubmit={submit}><fieldset disabled={state.busy} className="form-grid">
         <Field label="Find tenant"><input value={leaseSearch} onChange={event => setLeaseSearch(event.target.value)} /></Field>
-        <Field label="Tenant and lease"><select required value={leaseId} onChange={event => setLease(event.target.value)}><option value="">Choose tenant and room</option>
+        <Field label="Tenant and lease"><select required value={leaseId} onChange={event => { setLease(event.target.value); setAllocationValues({}); }}><option value="">Choose tenant and room</option>
           {selected.data && !leases.data?.some(row => row.id === selected.data?.id) && <option value={selected.data.id}>{selected.data.tenant.name} · {selected.data.room.name}</option>}
           {leases.data?.map(row => <option value={row.id} key={row.id}>{row.tenant.name} · {row.room.name} · {row.startsOn.slice(0, 10)}</option>)}</select></Field>
-        <Field label="Amount received (₹)"><input required name="amount" inputMode="decimal" /></Field>
+        <Field label="Amount received (₹)"><input required name="amount" inputMode="decimal" value={amount} onChange={event => setAmount(event.target.value)} /></Field>
         <Field label="Actual payment date and time (IST)"><input required name="paidAt" type="datetime-local" defaultValue={istInput()} /></Field>
         <Field label="Payment mode"><select value={mode} onChange={event => setMode(event.target.value === 'ONLINE' ? 'ONLINE' : 'CASH')}><option value="CASH">Cash</option><option value="ONLINE">Online</option></select></Field>
         {mode === 'ONLINE' && <Field label="Online transaction reference"><input required name="reference" maxLength={100} /></Field>}
         <Field label="Payment notes"><textarea name="notes" maxLength={2000} /></Field>
-        <div className="form-end"><h3>Apply to rent months</h3><Result busy={!!leaseId && charges.isPending} error={charges.error} empty={!!leaseId && !charges.data?.some(row => row.outstandingPaise > 0)}><AllocationFields key={leaseId} rows={charges.data ?? []} /></Result>
+        <div className="form-end"><h3>Apply to rent months</h3>
+          <button className="button secondary" type="button" disabled={!leaseId || !summary.amountPaise || charges.isPending || !!charges.error} onClick={() => {
+            try { setAllocationValues(allocateOldest(amount, charges.data ?? [])); }
+            catch (error) { setState(value => ({ ...value, error: messageOf(error) })); }
+          }}>Apply to oldest unpaid rent</button>
+          <Result busy={!!leaseId && charges.isPending} error={charges.error} empty={!!leaseId && !charges.data?.some(row => row.outstandingPaise > 0)}><AllocationFields key={leaseId} rows={charges.data ?? []} values={allocationValues} onChange={(id, value) => setAllocationValues(previous => ({ ...previous, [id]: value }))} /></Result>
           {leaseId && <Link to={`/ledger?leaseId=${leaseId}`}>Open lease ledger to generate more months</Link>}</div>
-        <label className="check"><input type="checkbox" name="allowCredit" /> Keep any unallocated amount as advance credit for this lease</label>
+        <label className="check"><input type="checkbox" name="allowCredit" checked={allowCredit} onChange={event => setAllowCredit(event.target.checked)} /> Keep any unallocated amount as advance credit for this lease</label>
+        <div className="form-end" aria-live="polite"><dl className="details">
+          <dt>Applied to rent</dt><dd><Amount value={summary.allocatedPaise} /></dd>
+          <dt>Remaining to allocate</dt><dd><Amount value={summary.remainingPaise} /></dd>
+          <dt>Advance credit to retain</dt><dd><Amount value={summary.creditPaise} /></dd>
+        </dl>{amount && summary.error && <p className="error">{summary.error}</p>}</div>
         {state.duplicate && <label className="check"><input type="checkbox" name="acknowledgeReference" required /> I verified the repeated reference and want to record a separate payment</label>}
-        <div className="form-end"><button className="button" type="submit" disabled={!leaseId}>{state.busy ? 'Recording…' : 'Confirm payment'}</button>{state.error && <p className="error" role="alert">{state.error}</p>}</div>
+        <div className="form-end"><button className="button" type="submit" disabled={!leaseId || !!summary.error || charges.isPending || !!charges.error}>{state.busy ? 'Recording…' : 'Confirm payment'}</button>{state.error && <p className="error" role="alert">{state.error}</p>}</div>
       </fieldset></form></Panel>}
   </Page>;
 }
@@ -184,6 +210,7 @@ export function ReceiptPage() {
           <dt>Advance credit available</dt><dd><Amount value={value.creditPaise} /></dd></dl>
         {value.notes && <p>{value.notes}</p>}{value.reversal && <p className="error">Reversed {localInstant(value.reversal.createdAt)} IST · {value.reversal.reason}</p>}
         <Table headers={['Billing month', 'Allocation']}>{value.allocations.map(row => <tr key={row.id}><td>{row.charge.period.slice(0, 7)}</td><td><Amount value={row.amountPaise} /></td></tr>)}</Table>
+        <Link className="print-hidden" to={`/activity?entityId=${value.id}`}>View payment activity</Link>
       </Panel>
       {!value.reversal && <div className="split print-hidden">
         {value.creditPaise > 0 && <Panel title="Apply advance credit"><ActionForm label="Apply credit" onSubmit={async form => {

@@ -375,6 +375,13 @@ model BackupRun {
   bytes       BigInt?
   sha256      String?
   keyVersion  String?
+  storageId   String?
   reason      String?
   @@index([status, startedAt])
+  @@index([storageId, status, startedAt])
+}
+
+model WorkerHeartbeat {
+  name            String @id
+  lastSucceededAt DateTime @db.Timestamptz(3)
 }
